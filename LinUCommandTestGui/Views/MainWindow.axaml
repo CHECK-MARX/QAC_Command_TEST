@@ -8,7 +8,6 @@
         d:DesignHeight="900"
         x:Class="LinUCommandTestGui.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
-        Icon="/Assets/avalonia-logo.ico"
         Title="{Binding T[HeaderTitle]}">
 
     <Window.Styles>
