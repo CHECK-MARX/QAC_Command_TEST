@@ -95,14 +95,107 @@ public partial class MainWindow : Window
         }
     }
 
-    private static string NormalizePickerPath(string path)
+    private async void OnBrowseEnvironmentDirectoryClick(object? sender, RoutedEventArgs e)
+    {
+        if (DataContext is not MainWindowViewModel vm)
+        {
+            return;
+        }
+
+        if (sender is not Button { Tag: string targetField })
+        {
+            return;
+        }
+
+        try
+        {
+            var topLevel = TopLevel.GetTopLevel(this);
+            if (topLevel?.StorageProvider is null)
+            {
+                vm.ReportUnhandledException("Storage provider is not available.");
+                return;
+            }
+
+            var currentPath = GetEnvironmentDirectoryValue(vm, targetField);
+            var options = new FolderPickerOpenOptions
+            {
+                Title = "Select directory",
+                AllowMultiple = false
+            };
+
+            var normalized = NormalizePickerPath(currentPath, vm);
+            if (Directory.Exists(normalized))
+            {
+                var suggested = await topLevel.StorageProvider.TryGetFolderFromPathAsync(normalized);
+                if (suggested is not null)
+                {
+                    options.SuggestedStartLocation = suggested;
+                }
+            }
+
+            var folders = await topLevel.StorageProvider.OpenFolderPickerAsync(options);
+            var selected = folders.FirstOrDefault();
+            if (selected is null)
+            {
+                return;
+            }
+
+            var localPath = selected.TryGetLocalPath();
+            if (string.IsNullOrWhiteSpace(localPath) && selected.Path.IsAbsoluteUri)
+            {
+                localPath = Uri.UnescapeDataString(selected.Path.LocalPath);
+            }
+
+            if (string.IsNullOrWhiteSpace(localPath))
+            {
+                vm.ReportUnhandledException("Failed to resolve selected folder path.");
+                return;
+            }
+
+            SetEnvironmentDirectoryValue(vm, targetField, localPath);
+        }
+        catch (Exception ex)
+        {
+            vm.ReportUnhandledException(ex.Message);
+        }
+    }
+
+    private static string GetEnvironmentDirectoryValue(MainWindowViewModel vm, string targetField)
+    {
+        return targetField switch
+        {
+            nameof(MainWindowViewModel.QafRoot) => vm.QafRoot,
+            nameof(MainWindowViewModel.QacliBinPath) => vm.QacliBinPath,
+            nameof(MainWindowViewModel.TestRoot) => vm.TestRoot,
+            _ => string.Empty
+        };
+    }
+
+    private static void SetEnvironmentDirectoryValue(MainWindowViewModel vm, string targetField, string value)
+    {
+        switch (targetField)
+        {
+            case nameof(MainWindowViewModel.QafRoot):
+                vm.QafRoot = value;
+                break;
+            case nameof(MainWindowViewModel.QacliBinPath):
+                vm.QacliBinPath = value;
+                break;
+            case nameof(MainWindowViewModel.TestRoot):
+                vm.TestRoot = value;
+                break;
+        }
+    }
+
+    private static string NormalizePickerPath(string path, MainWindowViewModel? vm = null)
     {
         if (string.IsNullOrWhiteSpace(path))
         {
             return string.Empty;
         }
 
-        var trimmed = path.Trim().Trim('"');
+        var trimmed = path.Trim().Trim('"').Replace("%QAF_ROOT%", vm?.QafRoot ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        trimmed = Environment.ExpandEnvironmentVariables(trimmed);
         if (trimmed == "~")
         {
             return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -112,6 +205,11 @@ public partial class MainWindow : Window
         {
             var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             return Path.Combine(home, trimmed[2..]);
+        }
+
+        if (!Path.IsPathRooted(trimmed) && vm is not null && !string.IsNullOrWhiteSpace(vm.LinURootPath))
+        {
+            trimmed = Path.Combine(vm.LinURootPath, trimmed);
         }
 
         return trimmed;

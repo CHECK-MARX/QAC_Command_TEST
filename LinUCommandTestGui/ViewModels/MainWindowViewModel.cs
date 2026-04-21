@@ -5,7 +5,10 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Threading;
@@ -18,6 +21,7 @@ public partial class MainWindowViewModel : ViewModelBase
 {
     public ObservableCollection<ProjectPairItemViewModel> CandidatePairs { get; } = new();
     public ObservableCollection<LiveLogEntry> LogLines { get; } = new();
+    public ObservableCollection<ParsedErrorItemViewModel> ErrorFindings { get; } = new();
     public ObservableCollection<LanguageOptionViewModel> LanguageOptions { get; } =
     [
         new LanguageOptionViewModel("ja", "日本語"),
@@ -106,6 +110,7 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(StartTestCommand))]
     [NotifyCanExecuteChangedFor(nameof(StopTestCommand))]
+    [NotifyCanExecuteChangedFor(nameof(PrecheckSettingsCommand))]
     private bool isRunning;
 
     [ObservableProperty]
@@ -148,6 +153,9 @@ public partial class MainWindowViewModel : ViewModelBase
 
     [ObservableProperty]
     private bool autoScrollLiveOutput = true;
+
+    [ObservableProperty]
+    private int extractedErrorCount;
 
     [ObservableProperty]
     private int runningProcessId;
@@ -199,8 +207,34 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private DateTime _runStartedUtc;
     private Process? _runningProcess;
+    private bool _stopRequested;
     private bool _stopRequestedByUser;
+    private bool _failureDetectedDuringRun;
+    private string _firstFailureLine = string.Empty;
+    private string _lastOutputLine = string.Empty;
+    private string _lastErrorHintLine = string.Empty;
+    private DateTime _lastOutputUtc = DateTime.UtcNow;
+    private DateTime _lastAutoConfirmSentUtc = DateTime.MinValue;
+    private int _observedOutputLineCount;
+    private CancellationTokenSource? _autoConfirmLoopCts;
+    private Task? _autoConfirmLoopTask;
+    private CancellationTokenSource? _runtimeStatusLoopCts;
+    private Task? _runtimeStatusLoopTask;
+    private readonly Dictionary<string, ParsedErrorItemViewModel> _errorFindingIndex = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _logWriteSemaphore = new(1, 1);
+    private static readonly HttpClient Http = new()
+    {
+        Timeout = TimeSpan.FromSeconds(5)
+    };
+    private static readonly Regex InvalidComponentRegex = new(
+        @"(?:component name|コンポーネント名)\s*'(?<name>[^']+)'",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex JapaneseSummaryRegex = new(
+        @"(?<success>\d+)\s*成功および、\s*(?<failed>\d+)\s*失敗",
+        RegexOptions.Compiled);
+    private static readonly Regex EnglishSummaryRegex = new(
+        @"(?<success>\d+)\s+success(?:es)?\s*(?:and|,)\s*(?<failed>\d+)\s+fail(?:ed|ures?)?",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly string[] TrackedEnvironmentKeys =
     [
         "QAF_ROOT",
@@ -467,10 +501,23 @@ public partial class MainWindowViewModel : ViewModelBase
 
             await ApplySelectionAsync();
             var launch = ResolveLaunchCommand();
+            var configurationErrors = ValidateLaunchConfiguration(launch);
+            if (configurationErrors.Count > 0)
+            {
+                throw new InvalidOperationException(BuildConfigurationErrorMessage(configurationErrors));
+            }
 
             IsRunning = true;
             IsPaused = false;
+            _stopRequested = false;
             _stopRequestedByUser = false;
+            _failureDetectedDuringRun = false;
+            _firstFailureLine = string.Empty;
+            _lastOutputLine = string.Empty;
+            _lastErrorHintLine = string.Empty;
+            _lastOutputUtc = DateTime.UtcNow;
+            _lastAutoConfirmSentUtc = DateTime.MinValue;
+            _observedOutputLineCount = 0;
             _runStartedUtc = DateTime.UtcNow;
             RunningProcessId = 0;
             ConfiguredLoopCount = Math.Max(1, SelectedPairCount);
@@ -482,6 +529,7 @@ public partial class MainWindowViewModel : ViewModelBase
             TotalSuccessInSummaries = 0;
             TotalFailureInSummaries = 0;
             LastError = string.Empty;
+            ResetExtractedErrors();
             CurrentRunLogPath = Path.Combine(OutputLogDirectoryPath, $"gui_run_{DateTime.Now:yyyyMMdd_HHmmss}.log");
             StatusText = "Starting...";
             RunResult = "RUNNING";
@@ -497,7 +545,7 @@ public partial class MainWindowViewModel : ViewModelBase
             LastOutputAgeSeconds = 0;
 
             Directory.CreateDirectory(OutputLogDirectoryPath);
-            await File.WriteAllTextAsync(CurrentRunLogPath, "[GUI] Start requested\n", new UTF8Encoding(false));
+            await File.WriteAllTextAsync(CurrentRunLogPath, string.Empty, new UTF8Encoding(false));
             AppendLog("[GUI] Start requested.", false, true);
             await AppendRunLogLineAsync("[GUI] Start requested.");
 
@@ -518,6 +566,8 @@ public partial class MainWindowViewModel : ViewModelBase
 
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
+            StartAutoConfirmLoop();
+            StartRuntimeStatusLoop();
             await process.WaitForExitAsync();
 
             try
@@ -545,12 +595,39 @@ public partial class MainWindowViewModel : ViewModelBase
                 return;
             }
 
-            if (exitCode == 0)
+            if (_stopRequested && StopOnFirstError && _failureDetectedDuringRun)
             {
-                ProcessedSummaryCount = ConfiguredLoopCount;
-                LoopStartedCount = ConfiguredLoopCount;
-                LoopCompletedCount = ConfiguredLoopCount;
-                TotalSuccessInSummaries = ConfiguredLoopCount;
+                LoopFailedCount = Math.Max(LoopFailedCount, 1);
+                TotalFailureInSummaries = Math.Max(TotalFailureInSummaries, 1);
+                NormalizeSingleLoopCountersAfterExit();
+                RunResult = "FAIL";
+                VerdictText = "FAIL";
+                var reason = BuildProcessFailureReason(
+                    exitCode,
+                    "Stopped on first error.");
+                VerdictReason = reason;
+                LastError = reason;
+                StatusText = "Stopped on first error.";
+                AppendLog($"[ERR] {reason}", true, false);
+                await AppendRunLogLineAsync($"[ERR] {reason}");
+                return;
+            }
+
+            if (exitCode == 0 && !_failureDetectedDuringRun)
+            {
+                if (ProcessedSummaryCount == 0)
+                {
+                    ProcessedSummaryCount = ConfiguredLoopCount;
+                }
+
+                LoopStartedCount = Math.Max(LoopStartedCount, ConfiguredLoopCount);
+                LoopCompletedCount = Math.Max(LoopCompletedCount, ConfiguredLoopCount);
+
+                if (TotalSuccessInSummaries == 0 && TotalFailureInSummaries == 0)
+                {
+                    TotalSuccessInSummaries = ConfiguredLoopCount;
+                }
+
                 TotalFailureInSummaries = 0;
                 ProgressPercentage = 100;
                 ProgressText = $"{ConfiguredLoopCount} / {ConfiguredLoopCount} (100.0%)";
@@ -563,14 +640,19 @@ public partial class MainWindowViewModel : ViewModelBase
             }
             else
             {
-                LoopFailedCount = 1;
-                TotalFailureInSummaries = 1;
+                LoopFailedCount = Math.Max(LoopFailedCount, 1);
+                TotalFailureInSummaries = Math.Max(TotalFailureInSummaries, 1);
+                NormalizeSingleLoopCountersAfterExit();
                 RunResult = "FAIL";
                 VerdictText = "FAIL";
-                VerdictReason = $"Process exited with code {exitCode}.";
-                StatusText = "Failed.";
-                AppendLog($"[ERR] Process exited with code {exitCode}.", true, false);
-                await AppendRunLogLineAsync($"[ERR] Process exited with code {exitCode}.");
+                var reason = exitCode != 0
+                    ? BuildProcessFailureReason(exitCode)
+                    : BuildOutputFailureReason();
+                VerdictReason = reason;
+                LastError = reason;
+                StatusText = exitCode != 0 ? "Failed." : "Completed with errors.";
+                AppendLog($"[ERR] {reason}", true, false);
+                await AppendRunLogLineAsync($"[ERR] {reason}");
             }
         }
         catch (Exception ex)
@@ -582,11 +664,63 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         finally
         {
+            await StopRuntimeStatusLoopAsync();
+            await StopAutoConfirmLoopAsync();
             _runningProcess?.Dispose();
             _runningProcess = null;
             IsRunning = false;
             IsPaused = false;
             RunningProcessId = 0;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanPrecheckSettings))]
+    private async Task PrecheckSettingsAsync()
+    {
+        try
+        {
+            var launch = ResolveLaunchCommand();
+            var errors = ValidateLaunchConfiguration(launch);
+            var warnings = new List<string>();
+
+            await ValidateConnectivityAndCredentialsAsync(errors, warnings);
+
+            if (errors.Count > 0)
+            {
+                var message = BuildConfigurationReport(errors, warnings);
+                SetError(message);
+                RunResult = "PRECHECK_FAIL";
+                VerdictText = "FAIL";
+                VerdictReason = "Precheck failed.";
+                return;
+            }
+
+            StatusText = warnings.Count == 0
+                ? "Precheck passed."
+                : "Precheck passed with warnings.";
+            RunResult = "PRECHECK_OK";
+            VerdictText = warnings.Count == 0 ? "PASS" : "WARN";
+            VerdictReason = warnings.Count == 0
+                ? "All configuration checks passed."
+                : BuildWarningsSummary(warnings);
+            LastError = warnings.Count == 0 ? string.Empty : BuildWarningsSummary(warnings);
+            AppendLog(
+                warnings.Count == 0
+                    ? "[GUI] Precheck passed."
+                    : $"[GUI] Precheck passed with warnings: {BuildWarningsSummary(warnings)}",
+                false,
+                true);
+            await AppendRunLogLineAsync(
+                warnings.Count == 0
+                    ? "[GUI] Precheck passed."
+                    : $"[GUI] Precheck passed with warnings: {BuildWarningsSummary(warnings)}");
+        }
+        catch (Exception ex)
+        {
+            SetError($"Precheck failed: {ex.Message}");
+            RunResult = "PRECHECK_FAIL";
+            VerdictText = "FAIL";
+            VerdictReason = ex.Message;
         }
     }
 
@@ -604,6 +738,7 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
+        _stopRequested = true;
         _stopRequestedByUser = true;
         StatusText = "Stopping...";
         RunResult = "STOPPING";
@@ -620,9 +755,15 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         LogLines.Clear();
         LiveOutputText = string.Empty;
+        ResetExtractedErrors();
     }
 
     private bool CanStartTest()
+    {
+        return !IsRunning;
+    }
+
+    private bool CanPrecheckSettings()
     {
         return !IsRunning;
     }
@@ -963,6 +1104,462 @@ public partial class MainWindowViewModel : ViewModelBase
         return false;
     }
 
+    private List<string> ValidateLaunchConfiguration(LaunchCommand launch)
+    {
+        var errors = new List<string>();
+
+        if (!Directory.Exists(LinURootPath))
+        {
+            errors.Add($"Selected directory does not exist: {LinURootPath}");
+        }
+
+        ValidatePathField("TEST_ROOT", TestRoot, errors, required: true, expectDirectory: true);
+        ValidatePathField("QAF_ROOT", QafRoot, errors, required: true, expectDirectory: true);
+        ValidatePathField("QACLI_BIN", QacliBinPath, errors, required: true, expectDirectory: true);
+
+        if (!string.IsNullOrWhiteSpace(QacliBinPath))
+        {
+            try
+            {
+                var resolvedQacliBin = ResolveConfiguredPath(QacliBinPath);
+                var qacliFileName = OperatingSystem.IsWindows() ? "qacli.exe" : "qacli";
+                var qacliPath = Path.Combine(resolvedQacliBin, qacliFileName);
+                if (Directory.Exists(resolvedQacliBin) && !File.Exists(qacliPath))
+                {
+                    errors.Add($"QACLI_BIN does not contain {qacliFileName}: {resolvedQacliBin}");
+                }
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"QACLI_BIN could not be resolved: {QacliBinPath} ({ex.Message})");
+            }
+        }
+
+        if (launch.FileName.Equals("cmd.exe", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(TestRoot))
+        {
+            try
+            {
+                var resolvedTestRoot = ResolveConfiguredPath(TestRoot);
+                if (!Directory.Exists(resolvedTestRoot))
+                {
+                    errors.Add($"Windows TEST_ROOT not found: {resolvedTestRoot}");
+                }
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"Windows TEST_ROOT could not be resolved: {TestRoot} ({ex.Message})");
+            }
+        }
+
+        return errors;
+    }
+
+    private async Task ValidateConnectivityAndCredentialsAsync(List<string> errors, List<string> warnings)
+    {
+        ValidateCredentialTriplet("QAV_SERVER", QavServer, "QAV_USER", QavUser, "QAV_PASS", QavPass, errors);
+        ValidateCredentialTriplet("VAL_SERVER", ValServer, "VAL_USER", ValUser, "VAL_PASS", ValPass, errors);
+
+        if (!string.IsNullOrWhiteSpace(QavServer))
+        {
+            await ValidateServerEndpointAsync("QAV_SERVER", QavServer, errors, warnings);
+        }
+
+        if (!string.IsNullOrWhiteSpace(ValServer))
+        {
+            await ValidateServerEndpointAsync("VAL_SERVER", ValServer, errors, warnings);
+        }
+
+        if (string.IsNullOrWhiteSpace(ValServer)
+            || string.IsNullOrWhiteSpace(ValUser)
+            || string.IsNullOrWhiteSpace(ValPass))
+        {
+            AddIssue(warnings, "VAL credential precheck skipped because VAL_SERVER/VAL_USER/VAL_PASS is incomplete.");
+            return;
+        }
+
+        if (!TryResolveQacliExecutablePath(out var qacliPath, out var qacliError))
+        {
+            AddIssue(errors, qacliError);
+            return;
+        }
+
+        await RunValidateAuthCheckAsync(qacliPath, errors, warnings);
+    }
+
+    private static void ValidateCredentialTriplet(
+        string serverName,
+        string serverValue,
+        string userName,
+        string userValue,
+        string passName,
+        string passValue,
+        List<string> errors)
+    {
+        if (string.IsNullOrWhiteSpace(serverValue))
+        {
+            AddIssue(errors, $"{serverName} is empty.");
+        }
+
+        if (string.IsNullOrWhiteSpace(userValue))
+        {
+            AddIssue(errors, $"{userName} is empty.");
+        }
+
+        if (string.IsNullOrWhiteSpace(passValue))
+        {
+            AddIssue(errors, $"{passName} is empty.");
+        }
+    }
+
+    private async Task ValidateServerEndpointAsync(string fieldName, string rawUrl, List<string> errors, List<string> warnings)
+    {
+        if (!TryBuildServerUri(rawUrl, out var serverUri, out var reason))
+        {
+            AddIssue(errors, $"{fieldName} is not a valid http/https URL: {rawUrl} ({reason})");
+            return;
+        }
+
+        try
+        {
+            _ = await Dns.GetHostAddressesAsync(serverUri.Host);
+        }
+        catch (Exception ex)
+        {
+            AddIssue(errors, $"{fieldName} host could not be resolved: {serverUri.Host} ({ex.Message})");
+            return;
+        }
+
+        try
+        {
+            using var headRequest = new HttpRequestMessage(HttpMethod.Head, serverUri);
+            using var headResponse = await Http.SendAsync(headRequest);
+            if (headResponse.StatusCode == HttpStatusCode.MethodNotAllowed)
+            {
+                using var getRequest = new HttpRequestMessage(HttpMethod.Get, serverUri);
+                using var _ = await Http.SendAsync(getRequest);
+            }
+        }
+        catch (TaskCanceledException)
+        {
+            AddIssue(errors, $"{fieldName} connection timed out: {serverUri}");
+        }
+        catch (HttpRequestException ex)
+        {
+            AddIssue(errors, $"{fieldName} is not reachable: {serverUri} ({ex.Message})");
+        }
+        catch (Exception ex)
+        {
+            AddIssue(warnings, $"{fieldName} connectivity check returned an unexpected error: {ex.Message}");
+        }
+    }
+
+    private static bool TryBuildServerUri(string rawUrl, out Uri serverUri, out string reason)
+    {
+        serverUri = default!;
+        reason = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(rawUrl))
+        {
+            reason = "empty";
+            return false;
+        }
+
+        var normalized = rawUrl.Trim();
+        if (!Uri.TryCreate(normalized, UriKind.Absolute, out var uri))
+        {
+            reason = "malformed URL";
+            return false;
+        }
+
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            reason = "scheme must be http or https";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(uri.Host))
+        {
+            reason = "host is empty";
+            return false;
+        }
+
+        serverUri = uri;
+        return true;
+    }
+
+    private bool TryResolveQacliExecutablePath(out string qacliPath, out string error)
+    {
+        qacliPath = string.Empty;
+        error = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(QacliBinPath))
+        {
+            error = "QACLI_BIN is empty.";
+            return false;
+        }
+
+        try
+        {
+            var resolvedQacliBin = ResolveConfiguredPath(QacliBinPath);
+            var qacliFileName = OperatingSystem.IsWindows() ? "qacli.exe" : "qacli";
+            var candidate = Path.Combine(resolvedQacliBin, qacliFileName);
+            if (!File.Exists(candidate))
+            {
+                error = $"QACLI_BIN does not contain {qacliFileName}: {resolvedQacliBin}";
+                return false;
+            }
+
+            qacliPath = candidate;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"QACLI_BIN could not be resolved: {QacliBinPath} ({ex.Message})";
+            return false;
+        }
+    }
+
+    private async Task RunValidateAuthCheckAsync(string qacliPath, List<string> errors, List<string> warnings)
+    {
+        var workingDirectory = Directory.Exists(LinURootPath)
+            ? LinURootPath
+            : Directory.GetCurrentDirectory();
+
+        var arguments = $"auth --validate --username {QuoteArgument(ValUser)} --password {QuoteArgument(ValPass)} --url {QuoteArgument(ValServer)}";
+        var result = await RunProcessForPrecheckAsync(qacliPath, arguments, workingDirectory, TimeSpan.FromSeconds(20));
+        if (result.TimedOut)
+        {
+            AddIssue(errors, "VAL authentication precheck timed out (20s).");
+            return;
+        }
+
+        if (result.ExitCode == 0)
+        {
+            return;
+        }
+
+        var detailLine = FirstNonEmptyLine(result.StdErr, result.StdOut);
+        var hint = InferConfigurationHint(detailLine);
+        var message = string.IsNullOrWhiteSpace(detailLine)
+            ? $"VAL authentication failed. qacli exited with code {result.ExitCode}."
+            : $"VAL authentication failed. {CompactLine(detailLine)}";
+        if (!string.IsNullOrWhiteSpace(hint))
+        {
+            message += $" Hint: {hint}";
+        }
+
+        AddIssue(errors, message);
+
+        if (string.IsNullOrWhiteSpace(detailLine))
+        {
+            AddIssue(warnings, "qacli auth --validate returned no detail output.");
+        }
+    }
+
+    private static async Task<PrecheckProcessResult> RunProcessForPrecheckAsync(
+        string fileName,
+        string arguments,
+        string workingDirectory,
+        TimeSpan timeout)
+    {
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = arguments,
+                WorkingDirectory = workingDirectory,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            }
+        };
+
+        if (!process.Start())
+        {
+            throw new InvalidOperationException($"Failed to start precheck command: {fileName}");
+        }
+
+        var stdOutTask = process.StandardOutput.ReadToEndAsync();
+        var stdErrTask = process.StandardError.ReadToEndAsync();
+        var waitTask = process.WaitForExitAsync();
+        var timeoutTask = Task.Delay(timeout);
+
+        var completedTask = await Task.WhenAny(waitTask, timeoutTask);
+        if (!ReferenceEquals(completedTask, waitTask))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // Ignore best-effort timeout kill failures.
+            }
+
+            await waitTask;
+            return new PrecheckProcessResult(
+                process.ExitCode,
+                await stdOutTask,
+                await stdErrTask,
+                true);
+        }
+
+        return new PrecheckProcessResult(
+            process.ExitCode,
+            await stdOutTask,
+            await stdErrTask,
+            false);
+    }
+
+    private static string QuoteArgument(string value)
+    {
+        var escaped = (value ?? string.Empty).Replace("\"", "\\\"", StringComparison.Ordinal);
+        return $"\"{escaped}\"";
+    }
+
+    private static string FirstNonEmptyLine(string first, string second)
+    {
+        static string Find(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return string.Empty;
+            }
+
+            var parts = text
+                .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            return parts.FirstOrDefault() ?? string.Empty;
+        }
+
+        var primary = Find(first);
+        return !string.IsNullOrWhiteSpace(primary) ? primary : Find(second);
+    }
+
+    private static string BuildConfigurationReport(List<string> errors, List<string> warnings)
+    {
+        var sb = new StringBuilder(BuildConfigurationErrorMessage(errors));
+        if (warnings.Count > 0)
+        {
+            sb.Append(Environment.NewLine);
+            sb.Append("Warnings:");
+            foreach (var warning in warnings)
+            {
+                sb.Append(Environment.NewLine);
+                sb.Append(" - ");
+                sb.Append(warning);
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    private static string BuildWarningsSummary(List<string> warnings)
+    {
+        if (warnings.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var shown = warnings
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Take(3)
+            .Select(CompactLine)
+            .ToList();
+        return shown.Count == 0
+            ? string.Empty
+            : string.Join(" | ", shown);
+    }
+
+    private static void AddIssue(List<string> target, string issue)
+    {
+        if (string.IsNullOrWhiteSpace(issue))
+        {
+            return;
+        }
+
+        if (!target.Contains(issue, StringComparer.Ordinal))
+        {
+            target.Add(issue);
+        }
+    }
+
+    private void ValidatePathField(string fieldName, string configuredValue, List<string> errors, bool required, bool expectDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(configuredValue))
+        {
+            if (required)
+            {
+                errors.Add($"{fieldName} is empty.");
+            }
+
+            return;
+        }
+
+        try
+        {
+            var resolved = ResolveConfiguredPath(configuredValue);
+            if (expectDirectory && !Directory.Exists(resolved))
+            {
+                errors.Add($"{fieldName} directory not found: {resolved}");
+            }
+        }
+        catch (Exception ex)
+        {
+            errors.Add($"{fieldName} could not be resolved: {configuredValue} ({ex.Message})");
+        }
+    }
+
+    private string ResolveConfiguredPath(string configuredValue)
+    {
+        var value = configuredValue.Trim().Trim('"');
+        if (!string.IsNullOrWhiteSpace(QafRoot))
+        {
+            value = value.Replace("%QAF_ROOT%", QafRoot, StringComparison.OrdinalIgnoreCase);
+            value = value.Replace("$QAF_ROOT", QafRoot, StringComparison.Ordinal);
+        }
+
+        value = Environment.ExpandEnvironmentVariables(value);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return value;
+        }
+
+        if (value == "~")
+        {
+            value = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        }
+        else if (value.StartsWith("~/", StringComparison.Ordinal) || value.StartsWith("~\\", StringComparison.Ordinal))
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            value = Path.Combine(home, value[2..]);
+        }
+
+        if (!Path.IsPathRooted(value))
+        {
+            value = Path.Combine(LinURootPath, value);
+        }
+
+        return Path.GetFullPath(value);
+    }
+
+    private static string BuildConfigurationErrorMessage(List<string> errors)
+    {
+        var sb = new StringBuilder();
+        sb.Append("Configuration error(s):");
+        foreach (var error in errors)
+        {
+            sb.Append(Environment.NewLine);
+            sb.Append(" - ");
+            sb.Append(error);
+        }
+
+        return sb.ToString();
+    }
+
     private LaunchCommand ResolveLaunchCommand()
     {
         var windowsScript = FindFirstExistingFile(LinURootPath, "test_loop.bat", "testloop.bat");
@@ -1040,31 +1637,220 @@ public partial class MainWindowViewModel : ViewModelBase
 
         Dispatcher.UIThread.Post(() =>
         {
+            var normalizedLine = line.Trim();
+            _observedOutputLineCount += 1;
+            _lastOutputLine = normalizedLine;
+            _lastOutputUtc = DateTime.UtcNow;
             AppendLog(line, isError, false);
             LastOutputTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             LastOutputAgeSeconds = 0;
             OutputActivity = "active";
+            UpdateRealtimeProgressFromOutput(normalizedLine);
 
-            if (isError || line.IndexOf("[ERR]", StringComparison.OrdinalIgnoreCase) >= 0)
+            var failureDetected = IsFailureOutputLine(normalizedLine);
+            if (failureDetected)
             {
                 ErrorLineCount += 1;
+                _lastErrorHintLine = normalizedLine;
+                MarkFailureDetected(normalizedLine);
+                RecordErrorFinding(normalizedLine);
 
-                if (StopOnFirstError && !_stopRequestedByUser)
+                if (StopOnFirstError && !_stopRequested)
                 {
-                    _ = StopTestAsync();
+                    _ = StopOnFirstErrorAsync(normalizedLine);
                 }
+            }
+            else if (IsErrorHintOutputLine(normalizedLine))
+            {
+                _lastErrorHintLine = normalizedLine;
+                RecordErrorFinding(normalizedLine);
             }
 
             if (AutoConfirmPrompts && IsPausePrompt(line))
             {
-                _ = SendAutoConfirmAsync();
+                _ = SendAutoConfirmAsync("prompt");
             }
 
             _ = AppendRunLogLineAsync(line);
         });
     }
 
-    private async Task SendAutoConfirmAsync()
+    private void MarkFailureDetected(string line)
+    {
+        if (!_failureDetectedDuringRun)
+        {
+            _failureDetectedDuringRun = true;
+            _firstFailureLine = line.Trim();
+            RunResult = "FAIL";
+            VerdictText = "FAIL";
+            VerdictReason = $"Failure detected in output: {_firstFailureLine}";
+            StatusText = RunningProcessId > 0
+                ? $"Running with failures (PID {RunningProcessId})"
+                : "Running with failures";
+            AppendLog("[GUI] Failure detected in output. Verdict switched to FAIL.", true, true);
+            _ = AppendRunLogLineAsync("[GUI] Failure detected in output. Verdict switched to FAIL.");
+            return;
+        }
+
+        RunResult = "FAIL";
+        VerdictText = "FAIL";
+    }
+
+    private async Task StopOnFirstErrorAsync(string reasonLine)
+    {
+        if (_stopRequested || _runningProcess is null)
+        {
+            return;
+        }
+
+        _stopRequested = true;
+        RunResult = "STOPPING";
+        VerdictText = "FAIL";
+        VerdictReason = $"Stopping on first error: {CompactLine(reasonLine)}";
+        StatusText = "Stopping on first error...";
+        AppendLog("[GUI] Stop requested automatically due to first error.", true, true);
+        await AppendRunLogLineAsync("[GUI] Stop requested automatically due to first error.");
+
+        if (!_runningProcess.HasExited)
+        {
+            await KillProcessTreeAsync(_runningProcess.Id);
+        }
+    }
+
+    private void StartAutoConfirmLoop()
+    {
+        _autoConfirmLoopCts?.Cancel();
+        _autoConfirmLoopCts?.Dispose();
+        _autoConfirmLoopCts = new CancellationTokenSource();
+        _autoConfirmLoopTask = RunAutoConfirmLoopAsync(_autoConfirmLoopCts.Token);
+    }
+
+    private void StartRuntimeStatusLoop()
+    {
+        _runtimeStatusLoopCts?.Cancel();
+        _runtimeStatusLoopCts?.Dispose();
+        _runtimeStatusLoopCts = new CancellationTokenSource();
+        _runtimeStatusLoopTask = RunRuntimeStatusLoopAsync(_runtimeStatusLoopCts.Token);
+    }
+
+    private async Task StopAutoConfirmLoopAsync()
+    {
+        if (_autoConfirmLoopCts is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _autoConfirmLoopCts.Cancel();
+            if (_autoConfirmLoopTask is not null)
+            {
+                await _autoConfirmLoopTask;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when cancellation happens while waiting delay.
+        }
+        finally
+        {
+            _autoConfirmLoopCts.Dispose();
+            _autoConfirmLoopCts = null;
+            _autoConfirmLoopTask = null;
+        }
+    }
+
+    private async Task StopRuntimeStatusLoopAsync()
+    {
+        if (_runtimeStatusLoopCts is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _runtimeStatusLoopCts.Cancel();
+            if (_runtimeStatusLoopTask is not null)
+            {
+                await _runtimeStatusLoopTask;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when cancellation happens while waiting delay.
+        }
+        finally
+        {
+            _runtimeStatusLoopCts.Dispose();
+            _runtimeStatusLoopCts = null;
+            _runtimeStatusLoopTask = null;
+        }
+    }
+
+    private async Task RunAutoConfirmLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            await Task.Delay(500, cancellationToken);
+
+            if (!AutoConfirmPrompts)
+            {
+                continue;
+            }
+
+            var process = _runningProcess;
+            if (process is null || process.HasExited)
+            {
+                return;
+            }
+
+            var cadenceMs = Math.Max(1000, PromptDelayMilliseconds);
+            var now = DateTime.UtcNow;
+            if ((now - _lastOutputUtc).TotalMilliseconds < cadenceMs)
+            {
+                continue;
+            }
+
+            if ((now - _lastAutoConfirmSentUtc).TotalMilliseconds < cadenceMs)
+            {
+                continue;
+            }
+
+            await SendAutoConfirmAsync("watchdog");
+        }
+    }
+
+    private async Task RunRuntimeStatusLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            await Task.Delay(1000, cancellationToken);
+
+            if (!IsRunning)
+            {
+                continue;
+            }
+
+            var nowUtc = DateTime.UtcNow;
+            var elapsed = nowUtc - _runStartedUtc;
+            var outputAgeSeconds = Math.Max(0, (int)(nowUtc - _lastOutputUtc).TotalSeconds);
+            var outputState = outputAgeSeconds > 2 ? "idle" : "active";
+
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (!IsRunning)
+                {
+                    return;
+                }
+
+                ElapsedTime = elapsed.ToString(@"hh\:mm\:ss");
+                LastOutputAgeSeconds = outputAgeSeconds;
+                OutputActivity = outputState;
+            });
+        }
+    }
+
+    private async Task SendAutoConfirmAsync(string reason = "prompt")
     {
         var process = _runningProcess;
         if (process is null || process.HasExited)
@@ -1074,12 +1860,17 @@ public partial class MainWindowViewModel : ViewModelBase
 
         try
         {
-            await process.StandardInput.WriteLineAsync(" ");
+            await process.StandardInput.WriteLineAsync(string.Empty);
             await process.StandardInput.FlushAsync();
+            _lastAutoConfirmSentUtc = DateTime.UtcNow;
 
             AutoEnterCount += 1;
-            AppendLog("[GUI] Auto-confirm sent.", false, true);
-            await AppendRunLogLineAsync("[GUI] Auto-confirm sent.");
+            if (!string.Equals(reason, "watchdog", StringComparison.Ordinal))
+            {
+                const string message = "[GUI] Auto-confirm sent.";
+                AppendLog(message, false, true);
+                await AppendRunLogLineAsync(message);
+            }
         }
         catch
         {
@@ -1089,6 +1880,11 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private async Task AppendRunLogLineAsync(string text)
     {
+        if (IsInternalGuiTraceLine(text))
+        {
+            return;
+        }
+
         if (string.IsNullOrWhiteSpace(CurrentRunLogPath))
         {
             return;
@@ -1111,9 +1907,460 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private static bool IsPausePrompt(string line)
     {
-        return (line.IndexOf("press any key", StringComparison.OrdinalIgnoreCase) >= 0)
-            || line.IndexOf("Press [Enter]", StringComparison.OrdinalIgnoreCase) >= 0
-            || line.IndexOf("続行するには何かキー", StringComparison.Ordinal) >= 0;
+        if (line.IndexOf("press any key", StringComparison.OrdinalIgnoreCase) >= 0
+            || line.IndexOf("Press [Enter]", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            return true;
+        }
+
+        if (line.IndexOf("続行するには何かキー", StringComparison.Ordinal) >= 0
+            || line.IndexOf("何かキーを押してください", StringComparison.Ordinal) >= 0
+            || line.IndexOf("邯夊｡後☆繧九↓縺ｯ菴輔°繧ｭ繝ｼ", StringComparison.Ordinal) >= 0)
+        {
+            return true;
+        }
+
+        return line.IndexOf(". . .", StringComparison.Ordinal) >= 0
+            && (line.IndexOf("キー", StringComparison.Ordinal) >= 0
+                || line.IndexOf("key", StringComparison.OrdinalIgnoreCase) >= 0);
+    }
+
+    private void NormalizeSingleLoopCountersAfterExit()
+    {
+        if (ConfiguredLoopCount != 1)
+        {
+            return;
+        }
+
+        if (LoopStartedCount == 0)
+        {
+            LoopStartedCount = 1;
+        }
+
+        if (LoopCompletedCount == 0)
+        {
+            LoopCompletedCount = 1;
+        }
+
+        if (ProcessedSummaryCount == 0)
+        {
+            ProcessedSummaryCount = 1;
+        }
+
+        ProgressPercentage = 100;
+        ProgressText = "1 / 1 (100.0%)";
+    }
+
+    private void UpdateRealtimeProgressFromOutput(string line)
+    {
+        if (!IsRunning || ConfiguredLoopCount <= 0)
+        {
+            return;
+        }
+
+        if (LoopStartedCount == 0)
+        {
+            LoopStartedCount = 1;
+        }
+
+        if (TryParseSummaryCounts(line, out var successCount, out var failureCount))
+        {
+            ProcessedSummaryCount += 1;
+            TotalSuccessInSummaries += successCount;
+            TotalFailureInSummaries += failureCount;
+        }
+
+        var pulseProgress = Math.Min(95.0, 95.0 * (1.0 - Math.Exp(-_observedOutputLineCount / 280.0)));
+        var summaryProgress = 0.0;
+        if (ProcessedSummaryCount > 0)
+        {
+            const int estimatedSummariesPerLoop = 12;
+            var estimatedTotalSummaries = Math.Max(1, ConfiguredLoopCount * estimatedSummariesPerLoop);
+            summaryProgress = Math.Min(95.0, (ProcessedSummaryCount * 100.0) / estimatedTotalSummaries);
+        }
+
+        var nextProgress = Math.Max(ProgressPercentage, Math.Max(pulseProgress, summaryProgress));
+        if (nextProgress > ProgressPercentage)
+        {
+            ProgressPercentage = nextProgress;
+            ProgressText = $"{Math.Min(LoopCompletedCount, ConfiguredLoopCount)} / {ConfiguredLoopCount} ({ProgressPercentage:0.0}%)";
+        }
+    }
+
+    private static bool TryParseSummaryCounts(string line, out int successCount, out int failureCount)
+    {
+        successCount = 0;
+        failureCount = 0;
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        var normalized = line.Trim();
+        var jaMatch = JapaneseSummaryRegex.Match(normalized);
+        if (jaMatch.Success
+            && int.TryParse(jaMatch.Groups["success"].Value, out successCount)
+            && int.TryParse(jaMatch.Groups["failed"].Value, out failureCount))
+        {
+            return true;
+        }
+
+        var enMatch = EnglishSummaryRegex.Match(normalized);
+        if (enMatch.Success
+            && int.TryParse(enMatch.Groups["success"].Value, out successCount)
+            && int.TryParse(enMatch.Groups["failed"].Value, out failureCount))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsFailureOutputLine(string line)
+    {
+        if (IsNonErrorSummaryLine(line) || IsCompatibilityLimitationLine(line))
+        {
+            return false;
+        }
+
+        if (IsLikelyPathListingLine(line))
+        {
+            return false;
+        }
+
+        if (line.IndexOf("[ERR]", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            return true;
+        }
+
+        var lower = line.ToLowerInvariant();
+        if (lower.Contains("not recognized as an internal or external command", StringComparison.Ordinal)
+            || lower.Contains("the system cannot find", StringComparison.Ordinal)
+            || lower.Contains("command not found", StringComparison.Ordinal)
+            || lower.Contains("no such file or directory", StringComparison.Ordinal)
+            || lower.Contains("fatal", StringComparison.Ordinal)
+            || lower.Contains("unhandled exception", StringComparison.Ordinal)
+            || lower.StartsWith("exception:", StringComparison.Ordinal)
+            || lower.StartsWith("exception ", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (line.IndexOf("見つかりません", StringComparison.Ordinal) >= 0
+            || line.IndexOf("エラー", StringComparison.Ordinal) >= 0
+            || line.IndexOf("失敗", StringComparison.Ordinal) >= 0)
+        {
+            return true;
+        }
+
+        if (ContainsFailureWord(lower, "error")
+            || ContainsFailureWord(lower, "failed")
+            || ContainsFailureWord(lower, "failure"))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsBenignStdErrLine(string line)
+    {
+        if (IsLikelyPathListingLine(line))
+        {
+            return true;
+        }
+
+        var lower = line.ToLowerInvariant();
+        return lower.Contains("files copied", StringComparison.Ordinal)
+            || lower.Contains("directories moved", StringComparison.Ordinal);
+    }
+
+    private static bool IsLikelyPathListingLine(string line)
+    {
+        var trimmed = line.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            return false;
+        }
+
+        if (!(trimmed.Contains('\\') || trimmed.Contains('/')))
+        {
+            return false;
+        }
+
+        if (trimmed.Contains(' '))
+        {
+            return false;
+        }
+
+        if (trimmed.StartsWith("[", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsErrorHintOutputLine(string line)
+    {
+        if (IsNonErrorSummaryLine(line) || IsCompatibilityLimitationLine(line))
+        {
+            return false;
+        }
+
+        var lower = line.ToLowerInvariant();
+        return lower.Contains("unauthorized", StringComparison.Ordinal)
+            || lower.Contains("forbidden", StringComparison.Ordinal)
+            || lower.Contains("authentication failed", StringComparison.Ordinal)
+            || lower.Contains("invalid username", StringComparison.Ordinal)
+            || lower.Contains("invalid user", StringComparison.Ordinal)
+            || lower.Contains("invalid password", StringComparison.Ordinal)
+            || lower.Contains("login failed", StringComparison.Ordinal)
+            || lower.Contains("connection refused", StringComparison.Ordinal)
+            || lower.Contains("actively refused", StringComparison.Ordinal)
+            || lower.Contains("timed out", StringComparison.Ordinal)
+            || lower.Contains("could not resolve", StringComparison.Ordinal)
+            || lower.Contains("name or service not known", StringComparison.Ordinal)
+            || lower.Contains("no such host", StringComparison.Ordinal);
+    }
+
+    private string BuildProcessFailureReason(int exitCode, string? prefix = null)
+    {
+        var line = GetMostRelevantFailureLine();
+        var hint = InferConfigurationHint(line);
+        var sb = new StringBuilder();
+        if (!string.IsNullOrWhiteSpace(prefix))
+        {
+            sb.Append(prefix.Trim());
+            sb.Append(' ');
+        }
+
+        sb.Append($"Process exited with code {exitCode}.");
+        if (!string.IsNullOrWhiteSpace(line))
+        {
+            sb.Append(" Last error line: ");
+            sb.Append(CompactLine(line));
+        }
+
+        if (!string.IsNullOrWhiteSpace(hint))
+        {
+            sb.Append(" Hint: ");
+            sb.Append(hint);
+        }
+
+        return sb.ToString().Trim();
+    }
+
+    private string BuildOutputFailureReason()
+    {
+        var line = GetMostRelevantFailureLine();
+        var hint = InferConfigurationHint(line);
+        var sb = new StringBuilder("Failure detected in output.");
+        if (!string.IsNullOrWhiteSpace(line))
+        {
+            sb.Append(" Last error line: ");
+            sb.Append(CompactLine(line));
+        }
+
+        if (!string.IsNullOrWhiteSpace(hint))
+        {
+            sb.Append(" Hint: ");
+            sb.Append(hint);
+        }
+
+        return sb.ToString();
+    }
+
+    private string GetMostRelevantFailureLine()
+    {
+        if (!string.IsNullOrWhiteSpace(_firstFailureLine))
+        {
+            return _firstFailureLine;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_lastErrorHintLine))
+        {
+            return _lastErrorHintLine;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_lastOutputLine))
+        {
+            return _lastOutputLine;
+        }
+
+        return string.Empty;
+    }
+
+    private static string InferConfigurationHint(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return string.Empty;
+        }
+
+        var lower = line.ToLowerInvariant();
+
+        if (lower.Contains("unauthorized", StringComparison.Ordinal)
+            || lower.Contains("forbidden", StringComparison.Ordinal)
+            || lower.Contains("authentication failed", StringComparison.Ordinal)
+            || lower.Contains("invalid username", StringComparison.Ordinal)
+            || lower.Contains("invalid user", StringComparison.Ordinal)
+            || lower.Contains("invalid password", StringComparison.Ordinal)
+            || lower.Contains("login failed", StringComparison.Ordinal)
+            || lower.Contains("401", StringComparison.Ordinal))
+        {
+            return "Check QAV_USER/QAV_PASS and VAL_USER/VAL_PASS.";
+        }
+
+        if (lower.Contains("could not resolve", StringComparison.Ordinal)
+            || lower.Contains("name or service not known", StringComparison.Ordinal)
+            || lower.Contains("no such host", StringComparison.Ordinal)
+            || lower.Contains("host not found", StringComparison.Ordinal))
+        {
+            return "Check QAV_SERVER / VAL_SERVER host names.";
+        }
+
+        if (lower.Contains("connection refused", StringComparison.Ordinal)
+            || lower.Contains("actively refused", StringComparison.Ordinal)
+            || lower.Contains("timed out", StringComparison.Ordinal)
+            || lower.Contains("timeout", StringComparison.Ordinal)
+            || lower.Contains("failed to connect", StringComparison.Ordinal))
+        {
+            return "Check server address/port and whether the server is running.";
+        }
+
+        if (lower.Contains("qacli is not recognized", StringComparison.Ordinal)
+            || lower.Contains("qacli: command not found", StringComparison.Ordinal)
+            || lower.Contains("not recognized as an internal or external command", StringComparison.Ordinal))
+        {
+            return "Check QACLI_BIN. qacli executable may not be found.";
+        }
+
+        if (lower.Contains("the system cannot find the path specified", StringComparison.Ordinal)
+            || lower.Contains("path not found", StringComparison.Ordinal)
+            || lower.Contains("no such file or directory", StringComparison.Ordinal))
+        {
+            return "Check TEST_ROOT / QAF_ROOT / QACLI_BIN paths.";
+        }
+
+        return string.Empty;
+    }
+
+    private static string CompactLine(string line)
+    {
+        var trimmed = line.Trim();
+        return trimmed.Length <= 220 ? trimmed : trimmed[..220] + "...";
+    }
+
+    private static bool ContainsFailureWord(string lowerLine, string keyword)
+    {
+        var start = 0;
+        while (true)
+        {
+            var index = lowerLine.IndexOf(keyword, start, StringComparison.Ordinal);
+            if (index < 0)
+            {
+                return false;
+            }
+
+            var before = index > 0 ? lowerLine[index - 1] : ' ';
+            var afterIndex = index + keyword.Length;
+            var after = afterIndex < lowerLine.Length ? lowerLine[afterIndex] : ' ';
+            var hasWordBoundary = !IsWordChar(before) && !IsWordChar(after);
+
+            if (hasWordBoundary)
+            {
+                if (!(lowerLine.Contains($"0 {keyword}", StringComparison.Ordinal)
+                    || lowerLine.Contains($"no {keyword}", StringComparison.Ordinal)
+                    || lowerLine.Contains($"without {keyword}", StringComparison.Ordinal)))
+                {
+                    return true;
+                }
+            }
+
+            start = index + keyword.Length;
+        }
+    }
+
+    private static bool IsWordChar(char c)
+    {
+        return char.IsLetterOrDigit(c) || c == '_' || c == '-';
+    }
+
+    private static bool IsCompatibilityLimitationLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        var normalized = line.Trim();
+        var lower = normalized.ToLowerInvariant();
+        if (IsQacliViewOptionParseLine(normalized, lower))
+        {
+            return true;
+        }
+
+        var componentMatch = InvalidComponentRegex.Match(normalized);
+        return componentMatch.Success
+            && (normalized.Contains("無効", StringComparison.Ordinal)
+                || normalized.Contains("辟｡蜉ｹ", StringComparison.Ordinal)
+                || lower.Contains("invalid", StringComparison.Ordinal));
+    }
+
+    private static bool IsQacliViewOptionParseLine(string normalized, string lower)
+    {
+        var hasParseMarker = normalized.Contains("パースエラー", StringComparison.Ordinal)
+            || normalized.Contains("繝代・繧ｹ繧ｨ繝ｩ繝ｼ", StringComparison.Ordinal)
+            || lower.Contains("parse error", StringComparison.Ordinal);
+        if (!hasParseMarker)
+        {
+            return false;
+        }
+
+        return normalized.Contains("-t (--type)", StringComparison.Ordinal)
+            || normalized.Contains("-m (--medium)", StringComparison.Ordinal)
+            || lower.Contains("--type", StringComparison.Ordinal)
+            || lower.Contains("--medium", StringComparison.Ordinal)
+            || lower.Contains("argument:-t", StringComparison.Ordinal)
+            || lower.Contains("argument:-m", StringComparison.Ordinal);
+    }
+
+    private static bool IsNonErrorSummaryLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        var normalized = line.Trim();
+        var lower = normalized.ToLowerInvariant();
+
+        if (lower.Contains("0 errors", StringComparison.Ordinal)
+            || lower.Contains("errors=0", StringComparison.Ordinal)
+            || lower.Contains("0 failed", StringComparison.Ordinal)
+            || lower.Contains("failures=0", StringComparison.Ordinal)
+            || lower.Contains("ok, 0 error", StringComparison.Ordinal)
+            || lower.Contains("0 error", StringComparison.Ordinal)
+            || lower.Contains("no errors", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (normalized.Contains("エラー=0", StringComparison.Ordinal)
+            || normalized.Contains("エラー 0", StringComparison.Ordinal)
+            || normalized.Contains("0 エラー", StringComparison.Ordinal)
+            || normalized.Contains("失敗=0", StringComparison.Ordinal)
+            || normalized.Contains("失敗 0", StringComparison.Ordinal)
+            || normalized.Contains("0 失敗", StringComparison.Ordinal)
+            || normalized.Contains("成功および、0 失敗", StringComparison.Ordinal)
+            || normalized.Contains("OK, 0 エラー", StringComparison.Ordinal)
+            || normalized.Contains("エラー 0 無効", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private static string? FindFirstExistingFile(string baseDirectory, params string[] fileNames)
@@ -1220,6 +2467,11 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void AppendLog(string text, bool isError, bool isCommand)
     {
+        if (IsInternalGuiTraceLine(text))
+        {
+            return;
+        }
+
         LogLines.Add(new LiveLogEntry(text, isError, isCommand));
 
         if (LogLines.Count > 4000)
@@ -1237,6 +2489,147 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    private static bool IsInternalGuiTraceLine(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        return text.TrimStart().StartsWith("[GUI]", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void ResetExtractedErrors()
+    {
+        ErrorFindings.Clear();
+        _errorFindingIndex.Clear();
+        ExtractedErrorCount = 0;
+    }
+
+    private void RecordErrorFinding(string line)
+    {
+        if (!TryDescribeError(line, out var insight))
+        {
+            return;
+        }
+
+        var normalized = CompactLine(line.Trim());
+        var key = $"{insight.Category}\u001F{normalized}";
+        if (_errorFindingIndex.TryGetValue(key, out var existing))
+        {
+            existing.MarkOccurrence();
+            RefreshExtractedErrorCount();
+            return;
+        }
+
+        var item = new ParsedErrorItemViewModel(
+            ErrorFindings.Count + 1,
+            insight.Category,
+            normalized,
+            insight.Explanation,
+            insight.Hint);
+        ErrorFindings.Add(item);
+        _errorFindingIndex[key] = item;
+        RefreshExtractedErrorCount();
+    }
+
+    private void RefreshExtractedErrorCount()
+    {
+        ExtractedErrorCount = ErrorFindings.Sum(x => Math.Max(1, x.Occurrences));
+    }
+
+    private static bool TryDescribeError(string line, out ErrorInsight insight)
+    {
+        insight = default!;
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        var normalized = line.Trim();
+        if (IsNonErrorSummaryLine(normalized))
+        {
+            return false;
+        }
+
+        if (IsCompatibilityLimitationLine(normalized))
+        {
+            return false;
+        }
+
+        var componentMatch = InvalidComponentRegex.Match(normalized);
+        if (componentMatch.Success
+            && (normalized.Contains("無効", StringComparison.Ordinal)
+                || normalized.Contains("invalid", StringComparison.OrdinalIgnoreCase)))
+        {
+            var componentName = componentMatch.Groups["name"].Value;
+            insight = new ErrorInsight(
+                "Component Version Mismatch",
+                $"Component '{componentName}' is not available in this QAC installation.",
+                "Match COM_* values to the available component versions listed by qacli.");
+            return true;
+        }
+
+        if (normalized.Contains("パースエラー", StringComparison.Ordinal)
+            || normalized.Contains("parse error", StringComparison.OrdinalIgnoreCase))
+        {
+            var hint = normalized.Contains("-t (--type)", StringComparison.Ordinal)
+                ? "Review qacli view -t value (tool version may not support the given type)."
+                : normalized.Contains("-m (--medium)", StringComparison.Ordinal)
+                    ? "Review qacli view -m value (allowed media differ by tool version)."
+                    : "Review command options for the installed qacli version.";
+            insight = new ErrorInsight(
+                "CLI Parse Error",
+                "Command arguments are not accepted by the current qacli.",
+                hint);
+            return true;
+        }
+
+        if ((normalized.Contains("見つけることができません", StringComparison.Ordinal)
+                || normalized.Contains("見つかりません", StringComparison.Ordinal)
+                || normalized.Contains("not found", StringComparison.OrdinalIgnoreCase))
+            && (normalized.Contains(".h", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains(".hpp", StringComparison.OrdinalIgnoreCase)))
+        {
+            insight = new ErrorInsight(
+                "Include Path Error",
+                "Required header file could not be resolved during analysis.",
+                "Check project include path settings and SOURCE_ROOT resolution.");
+            return true;
+        }
+
+        if (normalized.Contains("ユーザトークンを作成できません", StringComparison.Ordinal)
+            || normalized.Contains("authentication", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("unauthorized", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains("forbidden", StringComparison.OrdinalIgnoreCase))
+        {
+            insight = new ErrorInsight(
+                "Authentication Error",
+                "Authentication/token setup failed for QAV/Validate.",
+                "Check server URL, user, password, and permission scope.");
+            return true;
+        }
+
+        if (normalized.Contains("[ERR]", StringComparison.OrdinalIgnoreCase)
+            || IsFailureOutputLine(normalized)
+            || IsErrorHintOutputLine(normalized))
+        {
+            var hint = InferConfigurationHint(normalized);
+            if (string.IsNullOrWhiteSpace(hint))
+            {
+                hint = "Open the referenced qacli log and check the command just before this error.";
+            }
+
+            insight = new ErrorInsight(
+                "Runtime Error",
+                "A runtime failure indicator was detected in the test output.",
+                hint);
+            return true;
+        }
+
+        return false;
+    }
+
     private void SetError(string message)
     {
         LastError = message;
@@ -1244,6 +2637,7 @@ public partial class MainWindowViewModel : ViewModelBase
         ErrorLineCount += 1;
         AppendLog($"[ERR] {message}", true, false);
         _ = AppendRunLogLineAsync($"[ERR] {message}");
+        RecordErrorFinding(message);
     }
 
     private static string NormalizeLineValue(string input)
@@ -1337,6 +2731,62 @@ public partial class MainWindowViewModel : ViewModelBase
         Encoding StandardOutputEncoding,
         Encoding StandardErrorEncoding,
         string DisplayCommand);
+
+    private sealed record PrecheckProcessResult(
+        int ExitCode,
+        string StdOut,
+        string StdErr,
+        bool TimedOut);
+
+    private sealed record ErrorInsight(
+        string Category,
+        string Explanation,
+        string Hint);
+}
+
+public partial class ParsedErrorItemViewModel : ObservableObject
+{
+    public ParsedErrorItemViewModel(int index, string category, string errorText, string explanation, string hint)
+    {
+        Index = index;
+        Category = category;
+        ErrorText = errorText;
+        Explanation = explanation;
+        Hint = hint;
+        FirstSeenTime = DateTime.Now.ToString("HH:mm:ss");
+        LastSeenTime = FirstSeenTime;
+        Occurrences = 1;
+    }
+
+    [ObservableProperty]
+    private int index;
+
+    [ObservableProperty]
+    private string category;
+
+    [ObservableProperty]
+    private string errorText;
+
+    [ObservableProperty]
+    private string explanation;
+
+    [ObservableProperty]
+    private string hint;
+
+    [ObservableProperty]
+    private string firstSeenTime;
+
+    [ObservableProperty]
+    private string lastSeenTime;
+
+    [ObservableProperty]
+    private int occurrences;
+
+    public void MarkOccurrence()
+    {
+        Occurrences += 1;
+        LastSeenTime = DateTime.Now.ToString("HH:mm:ss");
+    }
 }
 
 public partial class ProjectPairItemViewModel : ObservableObject
@@ -1478,6 +2928,7 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
             ["QavCredential"] = "QAV Server / User / Password",
             ["ValCredential"] = "Validate Server / User / Password",
             ["SectionRunControl"] = "Run Control",
+            ["Precheck"] = "Precheck",
             ["StartTest"] = "Start Test",
             ["Stop"] = "Stop",
             ["ClearGuiLog"] = "Clear GUI Log",
@@ -1508,6 +2959,14 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
             ["LastError"] = "Last Error",
             ["RunLogFile"] = "Run Log File",
             ["SectionLiveOutput"] = "Live Output",
+            ["SectionErrorAnalysis"] = "Error Analysis",
+            ["ExtractedErrorCount"] = "Extracted Errors",
+            ["ErrorCategory"] = "Category",
+            ["ErrorExplanation"] = "Explanation",
+            ["ErrorHint"] = "Hint",
+            ["ErrorOccurrences"] = "Occurrences",
+            ["ErrorFirstSeen"] = "First Seen",
+            ["ErrorLastSeen"] = "Last Seen",
             ["AutoScrollLiveOutput"] = "Auto-scroll",
             ["CopySelectedLog"] = "Copy Selection"
         }

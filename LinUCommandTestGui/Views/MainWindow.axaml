@@ -125,13 +125,34 @@
                                         HorizontalAlignment="Left" />
 
                                 <TextBlock Text="QAF_ROOT" />
-                                <TextBox Text="{Binding QafRoot}" />
+                                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                                    <TextBox Grid.Column="0" Text="{Binding QafRoot}" />
+                                    <Button Grid.Column="1"
+                                            Tag="QafRoot"
+                                            Click="OnBrowseEnvironmentDirectoryClick"
+                                            Content="{Binding T[BrowseDir]}"
+                                            HorizontalAlignment="Left" />
+                                </Grid>
 
                                 <TextBlock Text="QACLI_BIN" />
-                                <TextBox Text="{Binding QacliBinPath}" />
+                                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                                    <TextBox Grid.Column="0" Text="{Binding QacliBinPath}" />
+                                    <Button Grid.Column="1"
+                                            Tag="QacliBinPath"
+                                            Click="OnBrowseEnvironmentDirectoryClick"
+                                            Content="{Binding T[BrowseDir]}"
+                                            HorizontalAlignment="Left" />
+                                </Grid>
 
                                 <TextBlock Text="TEST_ROOT" />
-                                <TextBox Text="{Binding TestRoot}" />
+                                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                                    <TextBox Grid.Column="0" Text="{Binding TestRoot}" />
+                                    <Button Grid.Column="1"
+                                            Tag="TestRoot"
+                                            Click="OnBrowseEnvironmentDirectoryClick"
+                                            Content="{Binding T[BrowseDir]}"
+                                            HorizontalAlignment="Left" />
+                                </Grid>
 
                                 <TextBlock Text="COM_QAC" />
                                 <TextBox Text="{Binding ComQac}" />
@@ -171,6 +192,7 @@
                     <StackPanel Spacing="8">
                         <TextBlock FontWeight="Bold" Text="{Binding T[SectionRunControl]}" />
                         <WrapPanel>
+                            <Button Command="{Binding PrecheckSettingsCommand}" Content="{Binding T[Precheck]}" Margin="0,0,8,0" />
                             <Button Command="{Binding StartTestCommand}" Content="{Binding T[StartTest]}" Margin="0,0,8,0" />
                             <Button Command="{Binding StopTestCommand}" Content="{Binding T[Stop]}" Margin="0,0,8,0" />
                             <Button Command="{Binding ClearLogsCommand}" Content="{Binding T[ClearGuiLog]}" />
@@ -268,26 +290,72 @@
                 </Border>
 
                 <Border Grid.Row="1" BorderBrush="#D0D0D0" BorderThickness="1" Padding="10" CornerRadius="4">
-                    <Grid RowDefinitions="Auto,*" RowSpacing="8">
-                        <WrapPanel Grid.Row="0">
-                            <TextBlock FontWeight="Bold" Text="{Binding T[SectionLiveOutput]}" Margin="0,0,12,0" />
-                            <CheckBox IsChecked="{Binding AutoScrollLiveOutput}"
-                                      Content="{Binding T[AutoScrollLiveOutput]}"
-                                      VerticalAlignment="Center"
-                                      Margin="0,0,12,0" />
-                            <Button Click="OnCopySelectedLiveOutputClick"
-                                    Content="{Binding T[CopySelectedLog]}" />
-                        </WrapPanel>
-                        <Border Grid.Row="1" BorderBrush="#CFCFCF" BorderThickness="1" CornerRadius="4">
-                            <TextBox x:Name="LiveOutputTextBox"
-                                     Text="{Binding LiveOutputText, Mode=OneWay}"
-                                     IsReadOnly="True"
-                                     AcceptsReturn="True"
-                                     TextWrapping="Wrap"
-                                     VerticalAlignment="Stretch"
-                                     ScrollViewer.VerticalScrollBarVisibility="Auto" />
-                        </Border>
-                    </Grid>
+                    <TabControl>
+                        <TabItem Header="{Binding T[SectionLiveOutput]}">
+                            <Grid RowDefinitions="Auto,*" RowSpacing="8">
+                                <WrapPanel Grid.Row="0">
+                                    <CheckBox IsChecked="{Binding AutoScrollLiveOutput}"
+                                              Content="{Binding T[AutoScrollLiveOutput]}"
+                                              VerticalAlignment="Center"
+                                              Margin="0,0,12,0" />
+                                    <Button Click="OnCopySelectedLiveOutputClick"
+                                            Content="{Binding T[CopySelectedLog]}" />
+                                </WrapPanel>
+                                <Border Grid.Row="1" BorderBrush="#CFCFCF" BorderThickness="1" CornerRadius="4">
+                                    <TextBox x:Name="LiveOutputTextBox"
+                                             Text="{Binding LiveOutputText, Mode=OneWay}"
+                                             IsReadOnly="True"
+                                             AcceptsReturn="True"
+                                             TextWrapping="Wrap"
+                                             VerticalAlignment="Stretch"
+                                             ScrollViewer.VerticalScrollBarVisibility="Auto" />
+                                </Border>
+                            </Grid>
+                        </TabItem>
+
+                        <TabItem Header="{Binding T[SectionErrorAnalysis]}">
+                            <Grid RowDefinitions="Auto,*" RowSpacing="8">
+                                <WrapPanel Grid.Row="0">
+                                    <TextBlock Text="{Binding T[ExtractedErrorCount]}" Margin="0,0,8,0" />
+                                    <TextBlock Text="{Binding ExtractedErrorCount}" FontWeight="Bold" />
+                                </WrapPanel>
+
+                                <Border Grid.Row="1" BorderBrush="#CFCFCF" BorderThickness="1" CornerRadius="4">
+                                    <ListBox ItemsSource="{Binding ErrorFindings}">
+                                        <ListBox.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:ParsedErrorItemViewModel">
+                                                <Border Margin="4,4,4,2" Padding="8" BorderBrush="#5A5A5A" BorderThickness="1" CornerRadius="4">
+                                                    <StackPanel Spacing="4">
+                                                        <TextBlock Foreground="#D12F2F" FontWeight="SemiBold" Text="{Binding ErrorText}" TextWrapping="Wrap" />
+                                                        <WrapPanel>
+                                                            <TextBlock Text="Category" Margin="0,0,6,0" />
+                                                            <TextBlock Text="{Binding Category}" FontWeight="SemiBold" />
+                                                            <TextBlock Margin="14,0,6,0" Text="Occurrences" />
+                                                            <TextBlock Text="{Binding Occurrences}" FontWeight="SemiBold" />
+                                                        </WrapPanel>
+                                                        <WrapPanel>
+                                                            <TextBlock Text="First Seen" Margin="0,0,6,0" />
+                                                            <TextBlock Text="{Binding FirstSeenTime}" />
+                                                            <TextBlock Margin="14,0,6,0" Text="Last Seen" />
+                                                            <TextBlock Text="{Binding LastSeenTime}" />
+                                                        </WrapPanel>
+                                                        <WrapPanel>
+                                                            <TextBlock Text="Explanation" Margin="0,0,6,0" />
+                                                            <TextBlock Text="{Binding Explanation}" TextWrapping="Wrap" />
+                                                        </WrapPanel>
+                                                        <WrapPanel>
+                                                            <TextBlock Text="Hint" Margin="0,0,6,0" />
+                                                            <TextBlock Text="{Binding Hint}" TextWrapping="Wrap" />
+                                                        </WrapPanel>
+                                                    </StackPanel>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ListBox.ItemTemplate>
+                                    </ListBox>
+                                </Border>
+                            </Grid>
+                        </TabItem>
+                    </TabControl>
                 </Border>
             </Grid>
         </Grid>
