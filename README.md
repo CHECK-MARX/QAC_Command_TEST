@@ -6,7 +6,8 @@
 
 - `LinUCommandTestGui/`
   - Avalonia (.NET 8) ベースの GUI アプリ
-  - 詳細ドキュメント: [`LinUCommandTestGui/README.md`](./LinUCommandTestGui/README.md)
+  - 現在実装されている機能の詳細は以下を参照してください。
+    - [`LinUCommandTestGui/README.md`](./LinUCommandTestGui/README.md)
 
 ## Note
 
