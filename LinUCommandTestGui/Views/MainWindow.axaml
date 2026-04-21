@@ -133,6 +133,24 @@
                                 <TextBlock Text="TEST_ROOT" />
                                 <TextBox Text="{Binding TestRoot}" />
 
+                                <TextBlock Text="COM_QAC" />
+                                <TextBox Text="{Binding ComQac}" />
+
+                                <TextBlock Text="COM_QACPP" />
+                                <TextBox Text="{Binding ComQacpp}" />
+
+                                <TextBlock Text="COM_RCMA" />
+                                <TextBox Text="{Binding ComRcma}" />
+
+                                <TextBlock Text="COM_MTA" />
+                                <TextBox Text="{Binding ComMta}" />
+
+                                <TextBlock Text="COM_NAME" />
+                                <TextBox Text="{Binding ComName}" />
+
+                                <TextBlock Text="COM_DATA" />
+                                <TextBox Text="{Binding ComData}" />
+
                                 <TextBlock Text="{Binding T[QavCredential]}" />
                                 <TextBox Text="{Binding QavServer}" />
                                 <TextBox Text="{Binding QavUser}" />

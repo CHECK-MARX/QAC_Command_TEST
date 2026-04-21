@@ -18,12 +18,15 @@
   - `master_settings/JISX0208_UTF8_I.txt`
   - `master_settings/JISX0208_UTF8_J.txt`
 
-### 2. 環境変数管理（testonce 連携）
-- `testonce.sh` から環境変数を読み込み、GUIに反映します。
+### 2. 環境変数管理（環境スクリプト連携）
+- ディレクトリ指定時に環境スクリプトから環境変数を読み込み、GUIに反映します。
+  - Linux: `testonce.sh`
+  - Windows: `test_loop.bat` / `testloop.bat`
   - `QAF_ROOT`, `QACLI_BIN`, `TEST_ROOT`
+  - `COM_QAC`, `COM_QACPP`, `COM_RCMA`, `COM_MTA`, `COM_NAME`, `COM_DATA`
   - `QAV_SERVER`, `QAV_USER`, `QAV_PASS`
   - `VAL_SERVER`, `VAL_USER`, `VAL_PASS`
-- GUI値を `testonce.sh` へ保存できます。
+- GUI値を読み込んだ環境スクリプトへ保存できます（Windowsは `.bat` を更新）。
 
 ### 3. 実行用スクリプト自動生成
 - 元スクリプトを直接編集せず、`Lin_U/.gui_runtime/` 配下に実行用スクリプトを生成します。
@@ -76,6 +79,19 @@ dotnet restore
 dotnet build -c Release
 ```
 
+## CI ビルド (GitHub Actions)
+
+- ワークフロー: `.github/workflows/ci-build.yml`
+- トリガー:
+  - `main` への push
+  - Pull Request
+  - 手動実行 (`workflow_dispatch`)
+- 生成物:
+  - Windows: `LinUCommandTestGui-win-x64.zip`
+  - Linux: `LinUCommandTestGui-linux-x64.tar.gz`
+
+GitHub の Actions 実行結果画面から、Artifacts としてダウンロードできます。
+
 ## 実行
 
 ```bash
@@ -86,6 +102,6 @@ dotnet run -c Release
 
 ## 対応環境と注意
 
-- 本アプリは `Lin_U` 側に `testonce.sh` / `testloop.sh` / `master_settings` がある構成を前提にします。
-- Windows では `testloop.bat` が存在すればそれを優先し、無い場合は `bash` 実行を試みます。
+- Linux は `testonce.sh` / `testloop.sh` / `master_settings` がある構成を前提にします。
+- Windows は `test_loop.bat`（または `testloop.bat`）を前提にし、環境値も `.bat` 側を読み書きします。
 - 疑似端末 (`script`) が使える環境では、手動実行に近い表示モードで起動します。

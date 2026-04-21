@@ -2,10 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
+using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 
@@ -54,6 +57,24 @@ public partial class MainWindowViewModel : ViewModelBase
 
     [ObservableProperty]
     private string testRoot = string.Empty;
+
+    [ObservableProperty]
+    private string comQac = string.Empty;
+
+    [ObservableProperty]
+    private string comQacpp = string.Empty;
+
+    [ObservableProperty]
+    private string comRcma = string.Empty;
+
+    [ObservableProperty]
+    private string comMta = string.Empty;
+
+    [ObservableProperty]
+    private string comName = string.Empty;
+
+    [ObservableProperty]
+    private string comData = string.Empty;
 
     [ObservableProperty]
     private string qavServer = string.Empty;
@@ -177,9 +198,31 @@ public partial class MainWindowViewModel : ViewModelBase
     private LanguageOptionViewModel? selectedLanguage;
 
     private DateTime _runStartedUtc;
+    private Process? _runningProcess;
+    private bool _stopRequestedByUser;
+    private readonly SemaphoreSlim _logWriteSemaphore = new(1, 1);
+    private static readonly string[] TrackedEnvironmentKeys =
+    [
+        "QAF_ROOT",
+        "QACLI_BIN",
+        "TEST_ROOT",
+        "COM_QAC",
+        "COM_QACPP",
+        "COM_RCMA",
+        "COM_MTA",
+        "COM_NAME",
+        "COM_DATA",
+        "QAV_SERVER",
+        "QAV_USER",
+        "QAV_PASS",
+        "VAL_SERVER",
+        "VAL_USER",
+        "VAL_PASS"
+    ];
 
     public MainWindowViewModel()
     {
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
         T.SetLanguage("ja");
         SelectedLanguage = LanguageOptions.FirstOrDefault();
         InitializePathsFromRoot();
@@ -215,10 +258,29 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void InitializePathsFromRoot()
     {
-        AllITablePath = Path.Combine(LinURootPath, "master_settings", "all", "JISX0208_UTF8_I.txt");
-        AllJTablePath = Path.Combine(LinURootPath, "master_settings", "all", "JISX0208_UTF8_J.txt");
-        ActiveITablePath = Path.Combine(LinURootPath, "master_settings", "JISX0208_UTF8_I.txt");
-        ActiveJTablePath = Path.Combine(LinURootPath, "master_settings", "JISX0208_UTF8_J.txt");
+        var masterSettingsDir = Path.Combine(LinURootPath, "master_settings");
+        var allDir = Path.Combine(masterSettingsDir, "all");
+
+        var sjisI = Path.Combine(masterSettingsDir, "JISX0208_SJIS_I.txt");
+        var sjisJ = Path.Combine(masterSettingsDir, "JISX0208_SJIS_J.txt");
+        var utf8I = Path.Combine(masterSettingsDir, "JISX0208_UTF8_I.txt");
+        var utf8J = Path.Combine(masterSettingsDir, "JISX0208_UTF8_J.txt");
+
+        if (File.Exists(sjisI) || File.Exists(sjisJ))
+        {
+            AllITablePath = Path.Combine(allDir, "JISX0208_SJIS_I.txt");
+            AllJTablePath = Path.Combine(allDir, "JISX0208_SJIS_J.txt");
+            ActiveITablePath = sjisI;
+            ActiveJTablePath = sjisJ;
+        }
+        else
+        {
+            AllITablePath = Path.Combine(allDir, "JISX0208_UTF8_I.txt");
+            AllJTablePath = Path.Combine(allDir, "JISX0208_UTF8_J.txt");
+            ActiveITablePath = utf8I;
+            ActiveJTablePath = utf8J;
+        }
+
         RuntimeDirectoryPath = Path.Combine(LinURootPath, ".gui_runtime");
         OutputLogDirectoryPath = Path.Combine(LinURootPath, "gui_logs");
     }
@@ -247,7 +309,15 @@ public partial class MainWindowViewModel : ViewModelBase
 
             TestRoot = LinURootPath;
             await ReloadPairsAsync();
-            StatusText = $"Loaded command test directory: {LinURootPath}";
+            var envPath = await LoadEnvironmentFromSourceScriptAsync();
+            if (envPath is null)
+            {
+                StatusText = $"Loaded command test directory: {LinURootPath}";
+            }
+            else
+            {
+                StatusText = $"Loaded command test directory and environment: {Path.GetFileName(envPath)}";
+            }
         }
         catch (Exception ex)
         {
@@ -260,26 +330,20 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         try
         {
-            var path = Path.Combine(LinURootPath, "testonce.sh");
+            var path = ResolveEnvironmentScriptPathForSave();
             EnsureDirectoryForFile(path);
 
-            var lines = new List<string>
+            if (path.EndsWith(".bat", StringComparison.OrdinalIgnoreCase))
             {
-                "#!/usr/bin/env bash",
-                $"export QAF_ROOT=\"{QafRoot}\"",
-                $"export QACLI_BIN=\"{QacliBinPath}\"",
-                $"export TEST_ROOT=\"{TestRoot}\"",
-                $"export QAV_SERVER=\"{QavServer}\"",
-                $"export QAV_USER=\"{QavUser}\"",
-                $"export QAV_PASS=\"{QavPass}\"",
-                $"export VAL_SERVER=\"{ValServer}\"",
-                $"export VAL_USER=\"{ValUser}\"",
-                $"export VAL_PASS=\"{ValPass}\""
-            };
+                await SaveEnvironmentToBatchScriptAsync(path);
+            }
+            else
+            {
+                await SaveEnvironmentToShellScriptAsync(path);
+            }
 
-            await File.WriteAllLinesAsync(path, lines, new UTF8Encoding(false));
-            StatusText = "Saved GUI environment values to testonce.sh.";
-            AppendLog("[GUI] testonce.sh updated from GUI values.", false, false);
+            StatusText = $"Saved GUI environment values to {Path.GetFileName(path)}.";
+            AppendLog($"[GUI] {Path.GetFileName(path)} updated from GUI values.", false, false);
         }
         catch (Exception ex)
         {
@@ -376,8 +440,11 @@ public partial class MainWindowViewModel : ViewModelBase
             EnsureDirectoryForFile(ActiveITablePath);
             EnsureDirectoryForFile(ActiveJTablePath);
 
-            await File.WriteAllLinesAsync(ActiveITablePath, selected.Select(x => NormalizeLineValue(x.IValue)), new UTF8Encoding(false));
-            await File.WriteAllLinesAsync(ActiveJTablePath, selected.Select(x => NormalizeLineValue(x.JValue)), new UTF8Encoding(false));
+            var iEncoding = ResolveTextEncodingForPath(ActiveITablePath);
+            var jEncoding = ResolveTextEncodingForPath(ActiveJTablePath);
+
+            await File.WriteAllLinesAsync(ActiveITablePath, selected.Select(x => NormalizeLineValue(x.IValue)), iEncoding);
+            await File.WriteAllLinesAsync(ActiveJTablePath, selected.Select(x => NormalizeLineValue(x.JValue)), jEncoding);
 
             SelectedPairCount = selected.Count;
             StatusText = $"Saved {selected.Count} selected pairs.";
@@ -395,26 +462,19 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             if (IsRunning)
             {
-                if (IsPaused)
-                {
-                    IsPaused = false;
-                    StatusText = RunningProcessId > 0 ? $"Running (PID {RunningProcessId})" : "Running";
-                    RunResult = "RUNNING";
-                    VerdictText = "RUNNING";
-                    VerdictReason = "Resumed from paused state.";
-                }
-
                 return;
             }
 
             await ApplySelectionAsync();
+            var launch = ResolveLaunchCommand();
 
             IsRunning = true;
             IsPaused = false;
+            _stopRequestedByUser = false;
             _runStartedUtc = DateTime.UtcNow;
-            RunningProcessId = Environment.ProcessId;
+            RunningProcessId = 0;
             ConfiguredLoopCount = Math.Max(1, SelectedPairCount);
-            LoopStartedCount = ConfiguredLoopCount;
+            LoopStartedCount = 0;
             LoopCompletedCount = 0;
             LoopFailedCount = 0;
             ErrorLineCount = 0;
@@ -423,7 +483,7 @@ public partial class MainWindowViewModel : ViewModelBase
             TotalFailureInSummaries = 0;
             LastError = string.Empty;
             CurrentRunLogPath = Path.Combine(OutputLogDirectoryPath, $"gui_run_{DateTime.Now:yyyyMMdd_HHmmss}.log");
-            StatusText = $"Running (PID {RunningProcessId})";
+            StatusText = "Starting...";
             RunResult = "RUNNING";
             VerdictText = "RUNNING";
             VerdictReason = "Test is running.";
@@ -439,23 +499,79 @@ public partial class MainWindowViewModel : ViewModelBase
             Directory.CreateDirectory(OutputLogDirectoryPath);
             await File.WriteAllTextAsync(CurrentRunLogPath, "[GUI] Start requested\n", new UTF8Encoding(false));
             AppendLog("[GUI] Start requested.", false, true);
+            await AppendRunLogLineAsync("[GUI] Start requested.");
 
-            await Task.Delay(250);
+            var process = BuildProcess(launch);
+            _runningProcess = process;
+            process.OutputDataReceived += (_, e) => HandleProcessOutputLine(e.Data, false);
+            process.ErrorDataReceived += (_, e) => HandleProcessOutputLine(e.Data, true);
 
-            ProcessedSummaryCount = ConfiguredLoopCount;
-            LoopCompletedCount = ConfiguredLoopCount;
-            TotalSuccessInSummaries = ConfiguredLoopCount;
-            TotalFailureInSummaries = 0;
-            ProgressPercentage = 100;
-            ProgressText = $"{ConfiguredLoopCount} / {ConfiguredLoopCount} (100.0%)";
-            RunResult = "PASS";
-            VerdictText = "PASS";
-            VerdictReason = "No failures detected in simulated run.";
-            StatusText = "Completed.";
+            if (!process.Start())
+            {
+                throw new InvalidOperationException("Failed to start command process.");
+            }
+
+            RunningProcessId = process.Id;
+            StatusText = $"Running (PID {RunningProcessId})";
+            AppendLog($"[GUI] Process started: {launch.DisplayCommand}", false, true);
+            await AppendRunLogLineAsync($"[GUI] Process started: {launch.DisplayCommand}");
+
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            await process.WaitForExitAsync();
+
+            try
+            {
+                process.CancelOutputRead();
+                process.CancelErrorRead();
+            }
+            catch
+            {
+                // Ignore cancellation exceptions after process exit.
+            }
+
+            var exitCode = process.ExitCode;
             ElapsedTime = (DateTime.UtcNow - _runStartedUtc).ToString(@"hh\:mm\:ss");
             OutputActivity = "idle";
 
-            AppendLog("[GUI] Completed.", false, true);
+            if (_stopRequestedByUser)
+            {
+                RunResult = "STOPPED";
+                VerdictText = "STOPPED";
+                VerdictReason = "Stopped by user.";
+                StatusText = "Stopped.";
+                AppendLog($"[GUI] Process stopped by user (exit code {exitCode}).", false, true);
+                await AppendRunLogLineAsync($"[GUI] Process stopped by user (exit code {exitCode}).");
+                return;
+            }
+
+            if (exitCode == 0)
+            {
+                ProcessedSummaryCount = ConfiguredLoopCount;
+                LoopStartedCount = ConfiguredLoopCount;
+                LoopCompletedCount = ConfiguredLoopCount;
+                TotalSuccessInSummaries = ConfiguredLoopCount;
+                TotalFailureInSummaries = 0;
+                ProgressPercentage = 100;
+                ProgressText = $"{ConfiguredLoopCount} / {ConfiguredLoopCount} (100.0%)";
+                RunResult = "PASS";
+                VerdictText = "PASS";
+                VerdictReason = "Process exited with code 0.";
+                StatusText = "Completed.";
+                AppendLog("[GUI] Completed.", false, true);
+                await AppendRunLogLineAsync("[GUI] Completed.");
+            }
+            else
+            {
+                LoopFailedCount = 1;
+                TotalFailureInSummaries = 1;
+                RunResult = "FAIL";
+                VerdictText = "FAIL";
+                VerdictReason = $"Process exited with code {exitCode}.";
+                StatusText = "Failed.";
+                AppendLog($"[ERR] Process exited with code {exitCode}.", true, false);
+                await AppendRunLogLineAsync($"[ERR] Process exited with code {exitCode}.");
+            }
         }
         catch (Exception ex)
         {
@@ -466,6 +582,8 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         finally
         {
+            _runningProcess?.Dispose();
+            _runningProcess = null;
             IsRunning = false;
             IsPaused = false;
             RunningProcessId = 0;
@@ -473,34 +591,28 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     [RelayCommand(CanExecute = nameof(CanStopTest))]
-    private void StopTest()
+    private async Task StopTestAsync()
     {
-        if (!IsRunning)
+        if (!IsRunning || _runningProcess is null)
         {
             StatusText = "No active process.";
             return;
         }
 
-        if (!IsPaused)
+        if (_stopRequestedByUser)
         {
-            IsPaused = true;
-            StatusText = "Paused. Press Start to resume.";
-            RunResult = "PAUSED";
-            VerdictText = "PAUSED";
-            VerdictReason = "Paused by user.";
-            AppendLog("[GUI] Paused by user.", false, true);
             return;
         }
 
-        IsPaused = false;
-        IsRunning = false;
-        RunningProcessId = 0;
-        StatusText = "Stopped.";
-        RunResult = "STOPPED";
-        VerdictText = "STOPPED";
-        VerdictReason = "Stopped by user.";
-        OutputActivity = "idle";
-        AppendLog("[GUI] Stopped by user.", true, true);
+        _stopRequestedByUser = true;
+        StatusText = "Stopping...";
+        RunResult = "STOPPING";
+        VerdictText = "STOPPING";
+        VerdictReason = "Stop requested by user.";
+        AppendLog("[GUI] Stop requested by user.", false, true);
+        await AppendRunLogLineAsync("[GUI] Stop requested by user.");
+
+        await KillProcessTreeAsync(_runningProcess.Id);
     }
 
     [RelayCommand]
@@ -512,12 +624,559 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private bool CanStartTest()
     {
-        return !IsRunning || IsPaused;
+        return !IsRunning;
     }
 
     private bool CanStopTest()
     {
-        return IsRunning || IsPaused;
+        return IsRunning;
+    }
+
+    private async Task<string?> LoadEnvironmentFromSourceScriptAsync()
+    {
+        var path = ResolveEnvironmentScriptPath();
+        if (path is null || !File.Exists(path))
+        {
+            return null;
+        }
+
+        var encoding = ResolveTextEncodingForPath(path);
+        var lines = await File.ReadAllLinesAsync(path, encoding);
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var line in lines)
+        {
+            if (!TryParseEnvironmentAssignment(line, out var key, out var value))
+            {
+                continue;
+            }
+
+            if (IsTrackedEnvironmentKey(key))
+            {
+                values[key] = value;
+            }
+        }
+
+        ApplyEnvironmentValues(values);
+        AppendLog($"[GUI] Loaded environment values from {Path.GetFileName(path)}.", false, false);
+        return path;
+    }
+
+    private void ApplyEnvironmentValues(Dictionary<string, string> values)
+    {
+        if (values.TryGetValue("QAF_ROOT", out var qafRoot))
+        {
+            QafRoot = qafRoot;
+        }
+
+        if (values.TryGetValue("QACLI_BIN", out var qacliBin))
+        {
+            QacliBinPath = qacliBin;
+        }
+
+        if (values.TryGetValue("TEST_ROOT", out var testRoot))
+        {
+            TestRoot = testRoot;
+        }
+
+        if (values.TryGetValue("COM_QAC", out var comQac))
+        {
+            ComQac = comQac;
+        }
+
+        if (values.TryGetValue("COM_QACPP", out var comQacpp))
+        {
+            ComQacpp = comQacpp;
+        }
+
+        if (values.TryGetValue("COM_RCMA", out var comRcma))
+        {
+            ComRcma = comRcma;
+        }
+
+        if (values.TryGetValue("COM_MTA", out var comMta))
+        {
+            ComMta = comMta;
+        }
+
+        if (values.TryGetValue("COM_NAME", out var comName))
+        {
+            ComName = comName;
+        }
+
+        if (values.TryGetValue("COM_DATA", out var comData))
+        {
+            ComData = comData;
+        }
+
+        if (values.TryGetValue("QAV_SERVER", out var qavServer))
+        {
+            QavServer = qavServer;
+        }
+
+        if (values.TryGetValue("QAV_USER", out var qavUser))
+        {
+            QavUser = qavUser;
+        }
+
+        if (values.TryGetValue("QAV_PASS", out var qavPass))
+        {
+            QavPass = qavPass;
+        }
+
+        if (values.TryGetValue("VAL_SERVER", out var valServer))
+        {
+            ValServer = valServer;
+        }
+
+        if (values.TryGetValue("VAL_USER", out var valUser))
+        {
+            ValUser = valUser;
+        }
+
+        if (values.TryGetValue("VAL_PASS", out var valPass))
+        {
+            ValPass = valPass;
+        }
+    }
+
+    private string? ResolveEnvironmentScriptPath()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return FindFirstExistingFile(LinURootPath, "test_loop.bat", "testloop.bat");
+        }
+
+        return FindFirstExistingFile(LinURootPath, "testonce.sh", "test_loop.bat", "testloop.bat");
+    }
+
+    private string ResolveEnvironmentScriptPathForSave()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return FindFirstExistingFile(LinURootPath, "test_loop.bat", "testloop.bat")
+                ?? Path.Combine(LinURootPath, "test_loop.bat");
+        }
+
+        var existing = ResolveEnvironmentScriptPath();
+        if (existing is not null)
+        {
+            return existing;
+        }
+
+        return Path.Combine(LinURootPath, "testonce.sh");
+    }
+
+    private async Task SaveEnvironmentToShellScriptAsync(string path)
+    {
+        var lines = File.Exists(path)
+            ? (await File.ReadAllLinesAsync(path, new UTF8Encoding(false))).ToList()
+            : new List<string> { "#!/usr/bin/env bash", string.Empty };
+
+        UpsertEnvironmentAssignments(lines, isBatch: false);
+        await File.WriteAllLinesAsync(path, lines, new UTF8Encoding(false));
+    }
+
+    private async Task SaveEnvironmentToBatchScriptAsync(string path)
+    {
+        var encoding = Encoding.GetEncoding(932);
+        var lines = File.Exists(path)
+            ? (await File.ReadAllLinesAsync(path, encoding)).ToList()
+            : new List<string> { "@ECHO OFF", string.Empty, "SETLOCAL ENABLEDELAYEDEXPANSION", string.Empty };
+
+        UpsertEnvironmentAssignments(lines, isBatch: true);
+        await File.WriteAllLinesAsync(path, lines, encoding);
+    }
+
+    private void UpsertEnvironmentAssignments(List<string> lines, bool isBatch)
+    {
+        foreach (var key in TrackedEnvironmentKeys)
+        {
+            var replacement = BuildEnvironmentLine(key, GetEnvironmentValue(key), isBatch);
+            var indexes = new List<int>();
+            for (var i = 0; i < lines.Count; i++)
+            {
+                if (TryParseEnvironmentAssignment(lines[i], out var lineKey, out _)
+                    && string.Equals(lineKey, key, StringComparison.OrdinalIgnoreCase))
+                {
+                    indexes.Add(i);
+                }
+            }
+
+            if (indexes.Count == 0)
+            {
+                lines.Add(replacement);
+                continue;
+            }
+
+            lines[indexes[0]] = replacement;
+            for (var i = indexes.Count - 1; i >= 1; i--)
+            {
+                lines.RemoveAt(indexes[i]);
+            }
+        }
+    }
+
+    private string GetEnvironmentValue(string key)
+    {
+        return key switch
+        {
+            "QAF_ROOT" => QafRoot,
+            "QACLI_BIN" => QacliBinPath,
+            "TEST_ROOT" => TestRoot,
+            "COM_QAC" => ComQac,
+            "COM_QACPP" => ComQacpp,
+            "COM_RCMA" => ComRcma,
+            "COM_MTA" => ComMta,
+            "COM_NAME" => ComName,
+            "COM_DATA" => ComData,
+            "QAV_SERVER" => QavServer,
+            "QAV_USER" => QavUser,
+            "QAV_PASS" => QavPass,
+            "VAL_SERVER" => ValServer,
+            "VAL_USER" => ValUser,
+            "VAL_PASS" => ValPass,
+            _ => string.Empty
+        };
+    }
+
+    private static string BuildEnvironmentLine(string key, string value, bool isBatch)
+    {
+        if (isBatch)
+        {
+            return $"SET {key}={value}";
+        }
+
+        var escaped = value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);
+        return $"export {key}=\"{escaped}\"";
+    }
+
+    private static bool TryParseEnvironmentAssignment(string line, out string key, out string value)
+    {
+        key = string.Empty;
+        value = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        var trimmed = line.Trim();
+        if (trimmed.StartsWith("#", StringComparison.Ordinal)
+            || trimmed.StartsWith("::", StringComparison.Ordinal)
+            || trimmed.StartsWith("REM ", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (trimmed.StartsWith("SETLOCAL", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("ENDLOCAL", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (trimmed.StartsWith("export ", StringComparison.OrdinalIgnoreCase))
+        {
+            return TryParseAssignmentBody(trimmed[7..].Trim(), out key, out value);
+        }
+
+        if (trimmed.StartsWith("set ", StringComparison.OrdinalIgnoreCase))
+        {
+            var body = trimmed[4..].TrimStart();
+            if (body.StartsWith("\"", StringComparison.Ordinal) && body.EndsWith("\"", StringComparison.Ordinal) && body.Length >= 2)
+            {
+                body = body[1..^1];
+            }
+
+            return TryParseAssignmentBody(body, out key, out value);
+        }
+
+        return TryParseAssignmentBody(trimmed, out key, out value);
+    }
+
+    private static bool TryParseAssignmentBody(string body, out string key, out string value)
+    {
+        key = string.Empty;
+        value = string.Empty;
+
+        var eqIndex = body.IndexOf('=');
+        if (eqIndex <= 0)
+        {
+            return false;
+        }
+
+        var keyCandidate = body[..eqIndex].Trim().Trim('"');
+        if (!IsValidEnvironmentKey(keyCandidate))
+        {
+            return false;
+        }
+
+        var valueCandidate = body[(eqIndex + 1)..].Trim();
+        if ((valueCandidate.StartsWith("\"", StringComparison.Ordinal) && valueCandidate.EndsWith("\"", StringComparison.Ordinal))
+            || (valueCandidate.StartsWith("'", StringComparison.Ordinal) && valueCandidate.EndsWith("'", StringComparison.Ordinal)))
+        {
+            if (valueCandidate.Length >= 2)
+            {
+                valueCandidate = valueCandidate[1..^1];
+            }
+        }
+
+        key = keyCandidate;
+        value = valueCandidate;
+        return true;
+    }
+
+    private static bool IsValidEnvironmentKey(string key)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return false;
+        }
+
+        var first = key[0];
+        if (!(char.IsLetter(first) || first == '_'))
+        {
+            return false;
+        }
+
+        for (var i = 1; i < key.Length; i++)
+        {
+            var c = key[i];
+            if (!(char.IsLetterOrDigit(c) || c == '_'))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsTrackedEnvironmentKey(string key)
+    {
+        foreach (var target in TrackedEnvironmentKeys)
+        {
+            if (string.Equals(target, key, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private LaunchCommand ResolveLaunchCommand()
+    {
+        var windowsScript = FindFirstExistingFile(LinURootPath, "test_loop.bat", "testloop.bat");
+        if (OperatingSystem.IsWindows() && windowsScript is not null)
+        {
+            return new LaunchCommand(
+                "cmd.exe",
+                $"/d /c \"\"{windowsScript}\"\"",
+                LinURootPath,
+                Encoding.GetEncoding(932),
+                Encoding.GetEncoding(932),
+                $"cmd.exe /d /c \"{windowsScript}\"");
+        }
+
+        var shellScript = FindFirstExistingFile(LinURootPath, "testloop.generated.sh", "testloop.sh", "test_loop.sh");
+        if (shellScript is not null)
+        {
+            return new LaunchCommand(
+                "bash",
+                $"\"{shellScript}\"",
+                LinURootPath,
+                new UTF8Encoding(false),
+                new UTF8Encoding(false),
+                $"bash \"{shellScript}\"");
+        }
+
+        throw new FileNotFoundException("No runnable script found. Expected test_loop.bat, testloop.bat, or testloop.sh.");
+    }
+
+    private Process BuildProcess(LaunchCommand launch)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = launch.FileName,
+            Arguments = launch.Arguments,
+            WorkingDirectory = launch.WorkingDirectory,
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            StandardOutputEncoding = launch.StandardOutputEncoding,
+            StandardErrorEncoding = launch.StandardErrorEncoding
+        };
+
+        SetEnvironmentIfNotEmpty(startInfo, "QAF_ROOT", QafRoot);
+        SetEnvironmentIfNotEmpty(startInfo, "QACLI_BIN", QacliBinPath);
+        SetEnvironmentIfNotEmpty(startInfo, "TEST_ROOT", TestRoot);
+        SetEnvironmentIfNotEmpty(startInfo, "COM_QAC", ComQac);
+        SetEnvironmentIfNotEmpty(startInfo, "COM_QACPP", ComQacpp);
+        SetEnvironmentIfNotEmpty(startInfo, "COM_RCMA", ComRcma);
+        SetEnvironmentIfNotEmpty(startInfo, "COM_MTA", ComMta);
+        SetEnvironmentIfNotEmpty(startInfo, "COM_NAME", ComName);
+        SetEnvironmentIfNotEmpty(startInfo, "COM_DATA", ComData);
+        SetEnvironmentIfNotEmpty(startInfo, "QAV_SERVER", QavServer);
+        SetEnvironmentIfNotEmpty(startInfo, "QAV_USER", QavUser);
+        SetEnvironmentIfNotEmpty(startInfo, "QAV_PASS", QavPass);
+        SetEnvironmentIfNotEmpty(startInfo, "VAL_SERVER", ValServer);
+        SetEnvironmentIfNotEmpty(startInfo, "VAL_USER", ValUser);
+        SetEnvironmentIfNotEmpty(startInfo, "VAL_PASS", ValPass);
+
+        return new Process
+        {
+            StartInfo = startInfo,
+            EnableRaisingEvents = true
+        };
+    }
+
+    private void HandleProcessOutputLine(string? line, bool isError)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return;
+        }
+
+        Dispatcher.UIThread.Post(() =>
+        {
+            AppendLog(line, isError, false);
+            LastOutputTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            LastOutputAgeSeconds = 0;
+            OutputActivity = "active";
+
+            if (isError || line.IndexOf("[ERR]", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                ErrorLineCount += 1;
+
+                if (StopOnFirstError && !_stopRequestedByUser)
+                {
+                    _ = StopTestAsync();
+                }
+            }
+
+            if (AutoConfirmPrompts && IsPausePrompt(line))
+            {
+                _ = SendAutoConfirmAsync();
+            }
+
+            _ = AppendRunLogLineAsync(line);
+        });
+    }
+
+    private async Task SendAutoConfirmAsync()
+    {
+        var process = _runningProcess;
+        if (process is null || process.HasExited)
+        {
+            return;
+        }
+
+        try
+        {
+            await process.StandardInput.WriteLineAsync(" ");
+            await process.StandardInput.FlushAsync();
+
+            AutoEnterCount += 1;
+            AppendLog("[GUI] Auto-confirm sent.", false, true);
+            await AppendRunLogLineAsync("[GUI] Auto-confirm sent.");
+        }
+        catch
+        {
+            // Ignore stdin write failures when process is terminating.
+        }
+    }
+
+    private async Task AppendRunLogLineAsync(string text)
+    {
+        if (string.IsNullOrWhiteSpace(CurrentRunLogPath))
+        {
+            return;
+        }
+
+        await _logWriteSemaphore.WaitAsync();
+        try
+        {
+            await File.AppendAllTextAsync(CurrentRunLogPath, text + Environment.NewLine, new UTF8Encoding(false));
+        }
+        catch
+        {
+            // Do not fail the run because of log write errors.
+        }
+        finally
+        {
+            _logWriteSemaphore.Release();
+        }
+    }
+
+    private static bool IsPausePrompt(string line)
+    {
+        return (line.IndexOf("press any key", StringComparison.OrdinalIgnoreCase) >= 0)
+            || line.IndexOf("Press [Enter]", StringComparison.OrdinalIgnoreCase) >= 0
+            || line.IndexOf("続行するには何かキー", StringComparison.Ordinal) >= 0;
+    }
+
+    private static string? FindFirstExistingFile(string baseDirectory, params string[] fileNames)
+    {
+        foreach (var fileName in fileNames)
+        {
+            var path = Path.Combine(baseDirectory, fileName);
+            if (File.Exists(path))
+            {
+                return path;
+            }
+        }
+
+        return null;
+    }
+
+    private static void SetEnvironmentIfNotEmpty(ProcessStartInfo startInfo, string key, string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        startInfo.Environment[key] = value;
+    }
+
+    private static async Task KillProcessTreeAsync(int pid)
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                using var killer = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "taskkill",
+                    Arguments = $"/PID {pid} /T /F",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                });
+
+                if (killer is not null)
+                {
+                    await killer.WaitForExitAsync();
+                }
+
+                return;
+            }
+
+            try
+            {
+                Process.GetProcessById(pid).Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // Ignore race where process has already exited.
+            }
+        }
+        catch
+        {
+            // Ignore best-effort stop failures.
+        }
     }
 
     private ProjectPairItemViewModel CreatePairItem(int index, string iValue, string jValue, bool isSelected)
@@ -584,6 +1243,7 @@ public partial class MainWindowViewModel : ViewModelBase
         StatusText = message;
         ErrorLineCount += 1;
         AppendLog($"[ERR] {message}", true, false);
+        _ = AppendRunLogLineAsync($"[ERR] {message}");
     }
 
     private static string NormalizeLineValue(string input)
@@ -601,9 +1261,23 @@ public partial class MainWindowViewModel : ViewModelBase
             return new List<string>();
         }
 
-        return File.ReadAllLines(path, Encoding.UTF8)
+        var encoding = ResolveTextEncodingForPath(path);
+
+        return File.ReadAllLines(path, encoding)
             .Select(x => x.Replace("\r", string.Empty).Replace("\uFEFF", string.Empty))
             .ToList();
+    }
+
+    private static Encoding ResolveTextEncodingForPath(string path)
+    {
+        if (path.EndsWith(".bat", StringComparison.OrdinalIgnoreCase)
+            || path.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase)
+            || path.IndexOf("SJIS", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            return Encoding.GetEncoding(932);
+        }
+
+        return new UTF8Encoding(false);
     }
 
     private static void EnsureDirectoryForFile(string path)
@@ -655,6 +1329,14 @@ public partial class MainWindowViewModel : ViewModelBase
         var linURoot = DetectDefaultLinURoot();
         return Directory.GetParent(linURoot)?.FullName ?? linURoot;
     }
+
+    private sealed record LaunchCommand(
+        string FileName,
+        string Arguments,
+        string WorkingDirectory,
+        Encoding StandardOutputEncoding,
+        Encoding StandardErrorEncoding,
+        string DisplayCommand);
 }
 
 public partial class ProjectPairItemViewModel : ObservableObject
@@ -730,14 +1412,14 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
             ["AddPairRow"] = "行を追加",
             ["DeleteRow"] = "削除",
             ["SelectedCount"] = "選択件数",
-            ["SectionEnvironment"] = "環境上書き (生成 testonce スクリプト)",
-            ["SaveEnvToScript"] = "GUI値を testonce.sh へ保存",
-            ["EnvLoadHint"] = "※ ディレクトリ指定時に testonce.sh を自動読込します",
+            ["SectionEnvironment"] = "環境上書き (環境スクリプト)",
+            ["SaveEnvToScript"] = "GUI値を環境スクリプトへ保存",
+            ["EnvLoadHint"] = "※ Windows は test_loop.bat、Linux は testonce.sh を自動読込します",
             ["QavCredential"] = "QAV サーバー / ユーザー / パスワード",
             ["ValCredential"] = "Validate サーバー / ユーザー / パスワード",
             ["SectionRunControl"] = "実行制御",
             ["StartTest"] = "テスト開始",
-            ["Stop"] = "一時停止/停止",
+            ["Stop"] = "停止",
             ["ClearGuiLog"] = "GUIログクリア",
             ["AutoConfirm"] = "Press [Enter] を自動入力",
             ["StopOnError"] = "最初のエラーで停止",
@@ -790,14 +1472,14 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
             ["AddPairRow"] = "Add Row",
             ["DeleteRow"] = "Delete",
             ["SelectedCount"] = "Selected Count",
-            ["SectionEnvironment"] = "Environment Overrides (generated testonce script)",
-            ["SaveEnvToScript"] = "Save GUI values to testonce.sh",
-            ["EnvLoadHint"] = "* testonce.sh is auto-loaded when directory is selected",
+            ["SectionEnvironment"] = "Environment Overrides (environment script)",
+            ["SaveEnvToScript"] = "Save GUI values to environment script",
+            ["EnvLoadHint"] = "* Windows loads test_loop.bat, Linux loads testonce.sh",
             ["QavCredential"] = "QAV Server / User / Password",
             ["ValCredential"] = "Validate Server / User / Password",
             ["SectionRunControl"] = "Run Control",
             ["StartTest"] = "Start Test",
-            ["Stop"] = "Pause/Stop",
+            ["Stop"] = "Stop",
             ["ClearGuiLog"] = "Clear GUI Log",
             ["AutoConfirm"] = "Auto-confirm 'Press [Enter]'",
             ["StopOnError"] = "Stop on first error",
