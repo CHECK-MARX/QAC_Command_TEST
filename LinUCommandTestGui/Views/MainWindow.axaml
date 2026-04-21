@@ -1,0 +1,278 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:LinUCommandTestGui.ViewModels"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d"
+        d:DesignWidth="1400"
+        d:DesignHeight="900"
+        x:Class="LinUCommandTestGui.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Icon="/Assets/avalonia-logo.ico"
+        Title="{Binding T[HeaderTitle]}">
+
+    <Window.Styles>
+        <Style Selector="TextBlock.log-error">
+            <Setter Property="Foreground" Value="#9A3A00" />
+        </Style>
+        <Style Selector="TextBlock.log-command">
+            <Setter Property="Foreground" Value="#C00000" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+        </Style>
+    </Window.Styles>
+
+    <Grid RowDefinitions="Auto,*" Margin="12">
+        <Border Grid.Row="0" Padding="10" Background="#13243A" CornerRadius="6" Margin="0,0,0,10">
+            <Grid ColumnDefinitions="*,Auto,150" ColumnSpacing="8">
+                <TextBlock Grid.Column="0"
+                           VerticalAlignment="Center"
+                           FontWeight="SemiBold"
+                           Foreground="White"
+                           Text="{Binding T[HeaderTitle]}" />
+
+                <TextBlock Grid.Column="1"
+                           VerticalAlignment="Center"
+                           Foreground="White"
+                           Text="{Binding T[Language]}" />
+
+                <ComboBox Grid.Column="2"
+                          ItemsSource="{Binding LanguageOptions}"
+                          SelectedItem="{Binding SelectedLanguage}"
+                          Width="145">
+                    <ComboBox.ItemTemplate>
+                        <DataTemplate x:DataType="vm:LanguageOptionViewModel">
+                            <TextBlock Text="{Binding DisplayName}" />
+                        </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                </ComboBox>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="1" ColumnDefinitions="470,*" ColumnSpacing="12">
+            <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto">
+                <StackPanel Spacing="10">
+                    <Border BorderBrush="#D0D0D0" BorderThickness="1" Padding="10" CornerRadius="4">
+                        <StackPanel Spacing="8">
+                            <TextBlock FontWeight="Bold" Text="{Binding T[SectionPaths]}" />
+
+                            <TextBlock Text="{Binding T[CommandTestDir]}" />
+                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                                <TextBox Grid.Column="0"
+                                         Text="{Binding CommandTestDirectoryPath}"
+                                         PlaceholderText="/path/to/command_test or /path/to/Lin_U" />
+                                <Button Grid.Column="1"
+                                        Click="OnBrowseCommandTestDirectoryClick"
+                                        Content="{Binding T[BrowseDir]}"
+                                        HorizontalAlignment="Left" />
+                            </Grid>
+
+                            <Button Command="{Binding LoadFromCommandTestDirectoryCommand}"
+                                    Content="{Binding T[LoadCommandDir]}"
+                                    HorizontalAlignment="Left" />
+
+                            <TextBlock Text="{Binding T[LinURoot]}" />
+                            <TextBox Text="{Binding LinURootPath}" PlaceholderText="/path/to/Lin_U" />
+
+                            <TextBlock Text="{Binding T[ActiveIPath]}" />
+                            <TextBox Text="{Binding ActiveITablePath}" />
+
+                            <TextBlock Text="{Binding T[ActiveJPath]}" />
+                            <TextBox Text="{Binding ActiveJTablePath}" />
+
+                            <WrapPanel>
+                                <Button Command="{Binding ReloadPairsCommand}" Content="{Binding T[ReloadPairs]}" Margin="0,0,8,0" />
+                                <Button Command="{Binding SelectFirstThreeCommand}" Content="{Binding T[SelectFirst3]}" Margin="0,0,8,0" />
+                                <Button Command="{Binding ApplySelectionCommand}" Content="{Binding T[ApplySelection]}" />
+                            </WrapPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <Border BorderBrush="#D0D0D0" BorderThickness="1" Padding="10" CornerRadius="4">
+                        <StackPanel Spacing="8">
+                            <TextBlock FontWeight="Bold" Text="{Binding T[SectionPairSelection]}" />
+                            <TextBlock Text="{Binding T[PairSelectionHint]}" />
+                            <WrapPanel>
+                                <TextBlock Text="{Binding T[SelectedCount]}" Margin="0,0,8,0" />
+                                <TextBlock Text="{Binding SelectedPairCount}" FontWeight="Bold" />
+                            </WrapPanel>
+                            <Button Command="{Binding AddPairRowCommand}" Content="{Binding T[AddPairRow]}" HorizontalAlignment="Left" />
+
+                            <Border BorderBrush="#CFCFCF" BorderThickness="1" Height="290" CornerRadius="4">
+                                <ListBox ItemsSource="{Binding CandidatePairs}">
+                                    <ListBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <Grid ColumnDefinitions="Auto,Auto,*,*,Auto" Margin="4,2" ColumnSpacing="6">
+                                                <CheckBox IsChecked="{Binding IsSelected}" VerticalAlignment="Center" />
+                                                <TextBlock Grid.Column="1" Margin="8,0,8,0" Text="{Binding Index}" Width="35" />
+                                                <TextBox Grid.Column="2" Text="{Binding IValue}" MinWidth="120" />
+                                                <TextBox Grid.Column="3" Text="{Binding JValue}" MinWidth="120" />
+                                                <Button Grid.Column="4"
+                                                        Content="X"
+                                                        Command="{Binding RemoveRowCommand}" />
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ListBox.ItemTemplate>
+                                </ListBox>
+                            </Border>
+                        </StackPanel>
+                    </Border>
+
+                    <Expander Header="{Binding T[SectionEnvironment]}" IsExpanded="False">
+                        <Border BorderBrush="#D0D0D0" BorderThickness="1" Padding="10" CornerRadius="4" Margin="0,8,0,0">
+                            <StackPanel Spacing="8">
+                                <TextBlock Text="{Binding T[EnvLoadHint]}" />
+                                <Button Command="{Binding SaveEnvironmentToSourceScriptCommand}"
+                                        Content="{Binding T[SaveEnvToScript]}"
+                                        HorizontalAlignment="Left" />
+
+                                <TextBlock Text="QAF_ROOT" />
+                                <TextBox Text="{Binding QafRoot}" />
+
+                                <TextBlock Text="QACLI_BIN" />
+                                <TextBox Text="{Binding QacliBinPath}" />
+
+                                <TextBlock Text="TEST_ROOT" />
+                                <TextBox Text="{Binding TestRoot}" />
+
+                                <TextBlock Text="{Binding T[QavCredential]}" />
+                                <TextBox Text="{Binding QavServer}" />
+                                <TextBox Text="{Binding QavUser}" />
+                                <TextBox Text="{Binding QavPass}" />
+
+                                <TextBlock Text="{Binding T[ValCredential]}" />
+                                <TextBox Text="{Binding ValServer}" />
+                                <TextBox Text="{Binding ValUser}" />
+                                <TextBox Text="{Binding ValPass}" />
+                            </StackPanel>
+                        </Border>
+                    </Expander>
+                </StackPanel>
+            </ScrollViewer>
+
+            <Grid Grid.Column="1" RowDefinitions="Auto,*" RowSpacing="10">
+                <Border Grid.Row="0" BorderBrush="#D0D0D0" BorderThickness="1" Padding="10" CornerRadius="4">
+                    <StackPanel Spacing="8">
+                        <TextBlock FontWeight="Bold" Text="{Binding T[SectionRunControl]}" />
+                        <WrapPanel>
+                            <Button Command="{Binding StartTestCommand}" Content="{Binding T[StartTest]}" Margin="0,0,8,0" />
+                            <Button Command="{Binding StopTestCommand}" Content="{Binding T[Stop]}" Margin="0,0,8,0" />
+                            <Button Command="{Binding ClearLogsCommand}" Content="{Binding T[ClearGuiLog]}" />
+                        </WrapPanel>
+
+                        <WrapPanel>
+                            <CheckBox IsChecked="{Binding AutoConfirmPrompts}" Content="{Binding T[AutoConfirm]}" Margin="0,0,16,0" />
+                            <CheckBox IsChecked="{Binding StopOnFirstError}" Content="{Binding T[StopOnError]}" />
+                        </WrapPanel>
+
+                        <WrapPanel>
+                            <TextBlock VerticalAlignment="Center" Text="{Binding T[PromptDelay]}" Margin="0,0,8,0" />
+                            <NumericUpDown Minimum="0" Maximum="10000" Increment="100" Value="{Binding PromptDelayMilliseconds}" Width="120" />
+                            <TextBlock VerticalAlignment="Center" Margin="16,0,0,0" Text="{Binding T[AutoEnterCount]}" />
+                            <TextBlock VerticalAlignment="Center" Margin="8,0,0,0" Text="{Binding AutoEnterCount}" />
+                        </WrapPanel>
+
+                        <Grid ColumnDefinitions="170,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="8" RowSpacing="4">
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="{Binding T[Status]}" FontWeight="Bold" />
+                            <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding StatusText}" />
+
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="{Binding T[RunResult]}" FontWeight="Bold" />
+                            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding RunResult}" />
+
+                            <TextBlock Grid.Row="2" Grid.Column="0" Text="{Binding T[ConfiguredLoops]}" FontWeight="Bold" />
+                            <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding ConfiguredLoopCount}" />
+
+                            <TextBlock Grid.Row="3" Grid.Column="0" Text="{Binding T[SummaryCount]}" FontWeight="Bold" />
+                            <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding ProcessedSummaryCount}" />
+
+                            <TextBlock Grid.Row="4" Grid.Column="0" Text="{Binding T[TotalSuccess]}" FontWeight="Bold" />
+                            <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding TotalSuccessInSummaries}" />
+
+                            <TextBlock Grid.Row="5" Grid.Column="0" Text="{Binding T[TotalFailure]}" FontWeight="Bold" />
+                            <TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding TotalFailureInSummaries}" />
+
+                            <TextBlock Grid.Row="6" Grid.Column="0" Text="{Binding T[RunningPid]}" FontWeight="Bold" />
+                            <TextBlock Grid.Row="6" Grid.Column="1" Text="{Binding RunningProcessId}" />
+
+                            <TextBlock Grid.Row="7" Grid.Column="0" Text="{Binding T[Elapsed]}" FontWeight="Bold" />
+                            <TextBlock Grid.Row="7" Grid.Column="1" Text="{Binding ElapsedTime}" />
+                        </Grid>
+
+                        <WrapPanel>
+                            <TextBlock Text="{Binding T[Verdict]}" FontWeight="Bold" Margin="0,0,8,0" />
+                            <TextBlock Text="{Binding VerdictText}" FontWeight="Bold" />
+                        </WrapPanel>
+                        <WrapPanel>
+                            <TextBlock Text="{Binding T[VerdictReason]}" Margin="0,0,8,0" />
+                            <TextBlock Text="{Binding VerdictReason}" TextWrapping="Wrap" />
+                        </WrapPanel>
+                        <WrapPanel>
+                            <TextBlock Text="{Binding T[OutputActivity]}" Margin="0,0,6,0" />
+                            <TextBlock Text="{Binding OutputActivity}" Margin="0,0,14,0" />
+                            <TextBlock Text="{Binding T[LastOutputTime]}" Margin="0,0,6,0" />
+                            <TextBlock Text="{Binding LastOutputTime}" Margin="0,0,14,0" />
+                            <TextBlock Text="{Binding T[LastOutputAge]}" Margin="0,0,6,0" />
+                            <TextBlock Text="{Binding LastOutputAgeSeconds}" />
+                            <TextBlock Text="s" />
+                        </WrapPanel>
+                        <WrapPanel>
+                            <TextBlock Text="{Binding T[LoopStarted]}" Margin="0,0,6,0" />
+                            <TextBlock Text="{Binding LoopStartedCount}" Margin="0,0,14,0" />
+                            <TextBlock Text="{Binding T[LoopCompleted]}" Margin="0,0,6,0" />
+                            <TextBlock Text="{Binding LoopCompletedCount}" Margin="0,0,14,0" />
+                            <TextBlock Text="{Binding T[LoopFailed]}" Margin="0,0,6,0" />
+                            <TextBlock Text="{Binding LoopFailedCount}" Margin="0,0,14,0" />
+                            <TextBlock Text="{Binding T[ErrorLineCount]}" Margin="0,0,6,0" />
+                            <TextBlock Text="{Binding ErrorLineCount}" />
+                        </WrapPanel>
+
+                        <StackPanel Spacing="4">
+                            <TextBlock FontWeight="Bold" Text="{Binding T[Progress]}" />
+                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                                <ProgressBar Grid.Column="0" Minimum="0" Maximum="100" Value="{Binding ProgressPercentage}" Height="14" />
+                                <TextBlock Grid.Column="1" VerticalAlignment="Center" Text="{Binding ProgressText}" />
+                            </Grid>
+                            <WrapPanel>
+                                <TextBlock Text="{Binding T[EstimatedFinish]}" Margin="0,0,6,0" />
+                                <TextBlock Text="{Binding EstimatedFinishTime}" Margin="0,0,14,0" />
+                                <TextBlock Text="{Binding T[EstimatedRemaining]}" Margin="0,0,6,0" />
+                                <TextBlock Text="{Binding EstimatedRemaining}" />
+                            </WrapPanel>
+                        </StackPanel>
+
+                        <WrapPanel>
+                            <TextBlock Foreground="#A40000" Text="{Binding T[LastError]}" Margin="0,0,6,0" />
+                            <TextBlock Foreground="#A40000" Text="{Binding LastError}" TextWrapping="Wrap" />
+                        </WrapPanel>
+                        <WrapPanel>
+                            <TextBlock Text="{Binding T[RunLogFile]}" Margin="0,0,6,0" />
+                            <TextBlock Text="{Binding CurrentRunLogPath}" TextWrapping="Wrap" />
+                        </WrapPanel>
+                    </StackPanel>
+                </Border>
+
+                <Border Grid.Row="1" BorderBrush="#D0D0D0" BorderThickness="1" Padding="10" CornerRadius="4">
+                    <Grid RowDefinitions="Auto,*" RowSpacing="8">
+                        <WrapPanel Grid.Row="0">
+                            <TextBlock FontWeight="Bold" Text="{Binding T[SectionLiveOutput]}" Margin="0,0,12,0" />
+                            <CheckBox IsChecked="{Binding AutoScrollLiveOutput}"
+                                      Content="{Binding T[AutoScrollLiveOutput]}"
+                                      VerticalAlignment="Center"
+                                      Margin="0,0,12,0" />
+                            <Button Click="OnCopySelectedLiveOutputClick"
+                                    Content="{Binding T[CopySelectedLog]}" />
+                        </WrapPanel>
+                        <Border Grid.Row="1" BorderBrush="#CFCFCF" BorderThickness="1" CornerRadius="4">
+                            <TextBox x:Name="LiveOutputTextBox"
+                                     Text="{Binding LiveOutputText, Mode=OneWay}"
+                                     IsReadOnly="True"
+                                     AcceptsReturn="True"
+                                     TextWrapping="Wrap"
+                                     VerticalAlignment="Stretch"
+                                     ScrollViewer.VerticalScrollBarVisibility="Auto" />
+                        </Border>
+                    </Grid>
+                </Border>
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>
