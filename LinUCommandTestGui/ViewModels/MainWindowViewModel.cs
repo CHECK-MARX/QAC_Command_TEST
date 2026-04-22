@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
@@ -235,6 +235,9 @@ public partial class MainWindowViewModel : ViewModelBase
     private static readonly Regex EnglishSummaryRegex = new(
         @"(?<success>\d+)\s+success(?:es)?\s*(?:and|,)\s*(?<failed>\d+)\s+fail(?:ed|ures?)?",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex GuiLoopMarkerRegex = new(
+        @"^\[GUI-LOOP-(?<type>START|DONE|FAIL)\]\s*(?<index>\d+)?",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly string[] TrackedEnvironmentKeys =
     [
         "QAF_ROOT",
@@ -259,6 +262,9 @@ public partial class MainWindowViewModel : ViewModelBase
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
         T.SetLanguage("ja");
         SelectedLanguage = LanguageOptions.FirstOrDefault();
+        StatusText = LocalizeText("\u5F85\u6A5F", "Idle");
+        RunResult = LocalizeText("\u672A\u958B\u59CB", "Not started");
+        VerdictText = LocalizeText("\u672A\u958B\u59CB", "Not started");
         InitializePathsFromRoot();
 
         if (Directory.Exists(LinURootPath))
@@ -278,7 +284,68 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         T.SetLanguage(value.Code);
+        OnPropertyChanged(nameof(PrecheckButtonText));
+        OnPropertyChanged(nameof(ErrorAnalysisTabTitle));
+        OnPropertyChanged(nameof(ExtractedErrorCountLabel));
+        OnPropertyChanged(nameof(SecondUnitText));
+        OnPropertyChanged(nameof(ErrorCategoryLabel));
+        OnPropertyChanged(nameof(ErrorOccurrencesLabel));
+        OnPropertyChanged(nameof(ErrorFirstSeenLabel));
+        OnPropertyChanged(nameof(ErrorLastSeenLabel));
+        OnPropertyChanged(nameof(ErrorExplanationLabel));
+        OnPropertyChanged(nameof(ErrorHintLabel));
     }
+
+    private bool IsJapaneseUiLanguage()
+    {
+        return string.Equals(SelectedLanguage?.Code, "ja", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string LocalizeText(string japanese, string english)
+    {
+        return IsJapaneseUiLanguage() ? japanese : english;
+    }
+
+    private string GetOutputActivityText(bool isActive)
+    {
+        return isActive
+            ? LocalizeText("\u7A3C\u50CD\u4E2D", "active")
+            : LocalizeText("\u5F85\u6A5F", "idle");
+    }
+
+    private string FormatRunningStatus(int pid)
+    {
+        return IsJapaneseUiLanguage()
+            ? $"\u5B9F\u884C\u4E2D (PID {pid})"
+            : $"Running (PID {pid})";
+    }
+
+    private string FormatRunningWithFailuresStatus(int pid)
+    {
+        return IsJapaneseUiLanguage()
+            ? $"\u30A8\u30E9\u30FC\u691C\u51FA\u4E2D\u3067\u5B9F\u884C\u4E2D (PID {pid})"
+            : $"Running with failures (PID {pid})";
+    }
+
+    public string PrecheckButtonText => LocalizeText("\u4E8B\u524D\u78BA\u8A8D", "Precheck");
+
+    public string ErrorAnalysisTabTitle => LocalizeText("\u30A8\u30E9\u30FC\u89E3\u6790", "Error Analysis");
+
+    public string ExtractedErrorCountLabel => LocalizeText("\u62BD\u51FA\u30A8\u30E9\u30FC\u6570", "Extracted Errors");
+
+    public string SecondUnitText => LocalizeText("\u79D2", "s");
+
+    public string ErrorCategoryLabel => LocalizeText("\u30AB\u30C6\u30B4\u30EA", "Category");
+
+    public string ErrorOccurrencesLabel => LocalizeText("\u767A\u751F\u56DE\u6570", "Occurrences");
+
+    public string ErrorFirstSeenLabel => LocalizeText("\u521D\u56DE\u691C\u51FA", "First Seen");
+
+    public string ErrorLastSeenLabel => LocalizeText("\u6700\u7D42\u691C\u51FA", "Last Seen");
+
+    public string ErrorExplanationLabel => LocalizeText("\u8AAC\u660E", "Explanation");
+
+    public string ErrorHintLabel => LocalizeText("\u30D2\u30F3\u30C8", "Hint");
 
     partial void OnLinURootPathChanged(string value)
     {
@@ -500,7 +567,7 @@ public partial class MainWindowViewModel : ViewModelBase
             }
 
             await ApplySelectionAsync();
-            var launch = ResolveLaunchCommand();
+            var launch = ResolveLaunchCommand(forExecution: true);
             var configurationErrors = ValidateLaunchConfiguration(launch);
             if (configurationErrors.Count > 0)
             {
@@ -531,16 +598,16 @@ public partial class MainWindowViewModel : ViewModelBase
             LastError = string.Empty;
             ResetExtractedErrors();
             CurrentRunLogPath = Path.Combine(OutputLogDirectoryPath, $"gui_run_{DateTime.Now:yyyyMMdd_HHmmss}.log");
-            StatusText = "Starting...";
+            StatusText = LocalizeText("\u958B\u59CB\u4E2D...", "Starting...");
             RunResult = "RUNNING";
             VerdictText = "RUNNING";
-            VerdictReason = "Test is running.";
+            VerdictReason = LocalizeText("\u30C6\u30B9\u30C8\u5B9F\u884C\u4E2D\u3067\u3059\u3002", "Test is running.");
             ProgressPercentage = 0;
             ProgressText = $"0 / {ConfiguredLoopCount} (0.0%)";
             EstimatedRemaining = "-";
             EstimatedFinishTime = "-";
             ElapsedTime = "00:00:00";
-            OutputActivity = "active";
+            OutputActivity = GetOutputActivityText(isActive: true);
             LastOutputTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             LastOutputAgeSeconds = 0;
 
@@ -560,7 +627,7 @@ public partial class MainWindowViewModel : ViewModelBase
             }
 
             RunningProcessId = process.Id;
-            StatusText = $"Running (PID {RunningProcessId})";
+            StatusText = FormatRunningStatus(RunningProcessId);
             AppendLog($"[GUI] Process started: {launch.DisplayCommand}", false, true);
             await AppendRunLogLineAsync($"[GUI] Process started: {launch.DisplayCommand}");
 
@@ -582,14 +649,14 @@ public partial class MainWindowViewModel : ViewModelBase
 
             var exitCode = process.ExitCode;
             ElapsedTime = (DateTime.UtcNow - _runStartedUtc).ToString(@"hh\:mm\:ss");
-            OutputActivity = "idle";
+            OutputActivity = GetOutputActivityText(isActive: false);
 
             if (_stopRequestedByUser)
             {
                 RunResult = "STOPPED";
                 VerdictText = "STOPPED";
-                VerdictReason = "Stopped by user.";
-                StatusText = "Stopped.";
+                VerdictReason = LocalizeText("\u30E6\u30FC\u30B6\u30FC\u306B\u3088\u308A\u505C\u6B62\u3055\u308C\u307E\u3057\u305F\u3002", "Stopped by user.");
+                StatusText = LocalizeText("\u505C\u6B62\u3057\u307E\u3057\u305F\u3002", "Stopped.");
                 AppendLog($"[GUI] Process stopped by user (exit code {exitCode}).", false, true);
                 await AppendRunLogLineAsync($"[GUI] Process stopped by user (exit code {exitCode}).");
                 return;
@@ -604,10 +671,10 @@ public partial class MainWindowViewModel : ViewModelBase
                 VerdictText = "FAIL";
                 var reason = BuildProcessFailureReason(
                     exitCode,
-                    "Stopped on first error.");
+                    LocalizeText("\u6700\u521D\u306E\u30A8\u30E9\u30FC\u691C\u51FA\u306B\u3088\u308A\u505C\u6B62\u3057\u307E\u3057\u305F\u3002", "Stopped on first error."));
                 VerdictReason = reason;
                 LastError = reason;
-                StatusText = "Stopped on first error.";
+                StatusText = LocalizeText("\u6700\u521D\u306E\u30A8\u30E9\u30FC\u3067\u505C\u6B62\u3057\u307E\u3057\u305F\u3002", "Stopped on first error.");
                 AppendLog($"[ERR] {reason}", true, false);
                 await AppendRunLogLineAsync($"[ERR] {reason}");
                 return;
@@ -630,11 +697,12 @@ public partial class MainWindowViewModel : ViewModelBase
 
                 TotalFailureInSummaries = 0;
                 ProgressPercentage = 100;
-                ProgressText = $"{ConfiguredLoopCount} / {ConfiguredLoopCount} (100.0%)";
+                UpdateProgressTextDisplay();
+                UpdateEstimatedTimeDisplay(DateTime.UtcNow - _runStartedUtc);
                 RunResult = "PASS";
                 VerdictText = "PASS";
-                VerdictReason = "Process exited with code 0.";
-                StatusText = "Completed.";
+                VerdictReason = LocalizeText("\u51E6\u7406\u304C\u6B63\u5E38\u7D42\u4E86\u3057\u307E\u3057\u305F\u3002 (exit code 0)", "Process exited with code 0.");
+                StatusText = LocalizeText("\u5B8C\u4E86\u3057\u307E\u3057\u305F\u3002", "Completed.");
                 AppendLog("[GUI] Completed.", false, true);
                 await AppendRunLogLineAsync("[GUI] Completed.");
             }
@@ -650,7 +718,9 @@ public partial class MainWindowViewModel : ViewModelBase
                     : BuildOutputFailureReason();
                 VerdictReason = reason;
                 LastError = reason;
-                StatusText = exitCode != 0 ? "Failed." : "Completed with errors.";
+                StatusText = exitCode != 0
+                    ? LocalizeText("\u5931\u6557\u3057\u307E\u3057\u305F\u3002", "Failed.")
+                    : LocalizeText("\u30A8\u30E9\u30FC\u691C\u51FA\u3067\u5B8C\u4E86\u3057\u307E\u3057\u305F\u3002", "Completed with errors.");
                 AppendLog($"[ERR] {reason}", true, false);
                 await AppendRunLogLineAsync($"[ERR] {reason}");
             }
@@ -691,17 +761,17 @@ public partial class MainWindowViewModel : ViewModelBase
                 SetError(message);
                 RunResult = "PRECHECK_FAIL";
                 VerdictText = "FAIL";
-                VerdictReason = "Precheck failed.";
+                VerdictReason = LocalizeText("\u4E8B\u524D\u78BA\u8A8D\u3067\u30A8\u30E9\u30FC\u3092\u691C\u51FA\u3057\u307E\u3057\u305F\u3002", "Precheck failed.");
                 return;
             }
 
             StatusText = warnings.Count == 0
-                ? "Precheck passed."
-                : "Precheck passed with warnings.";
+                ? LocalizeText("\u4E8B\u524D\u78BA\u8A8D\u306F\u6B63\u5E38\u3067\u3059\u3002", "Precheck passed.")
+                : LocalizeText("\u8B66\u544A\u3042\u308A\u3067\u4E8B\u524D\u78BA\u8A8D\u306F\u6B63\u5E38\u3067\u3059\u3002", "Precheck passed with warnings.");
             RunResult = "PRECHECK_OK";
             VerdictText = warnings.Count == 0 ? "PASS" : "WARN";
             VerdictReason = warnings.Count == 0
-                ? "All configuration checks passed."
+                ? LocalizeText("\u3059\u3079\u3066\u306E\u8A2D\u5B9A\u30C1\u30A7\u30C3\u30AF\u306B\u5408\u683C\u3057\u307E\u3057\u305F\u3002", "All configuration checks passed.")
                 : BuildWarningsSummary(warnings);
             LastError = warnings.Count == 0 ? string.Empty : BuildWarningsSummary(warnings);
             AppendLog(
@@ -729,7 +799,7 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         if (!IsRunning || _runningProcess is null)
         {
-            StatusText = "No active process.";
+            StatusText = LocalizeText("\u5B9F\u884C\u4E2D\u30D7\u30ED\u30BB\u30B9\u306F\u3042\u308A\u307E\u305B\u3093\u3002", "No active process.");
             return;
         }
 
@@ -740,10 +810,10 @@ public partial class MainWindowViewModel : ViewModelBase
 
         _stopRequested = true;
         _stopRequestedByUser = true;
-        StatusText = "Stopping...";
+        StatusText = LocalizeText("\u505C\u6B62\u4E2D...", "Stopping...");
         RunResult = "STOPPING";
         VerdictText = "STOPPING";
-        VerdictReason = "Stop requested by user.";
+        VerdictReason = LocalizeText("\u30E6\u30FC\u30B6\u30FC\u304C\u505C\u6B62\u3092\u8981\u6C42\u3057\u307E\u3057\u305F\u3002", "Stop requested by user.");
         AppendLog("[GUI] Stop requested by user.", false, true);
         await AppendRunLogLineAsync("[GUI] Stop requested by user.");
 
@@ -1560,18 +1630,22 @@ public partial class MainWindowViewModel : ViewModelBase
         return sb.ToString();
     }
 
-    private LaunchCommand ResolveLaunchCommand()
+    private LaunchCommand ResolveLaunchCommand(bool forExecution = false)
     {
         var windowsScript = FindFirstExistingFile(LinURootPath, "test_loop.bat", "testloop.bat");
         if (OperatingSystem.IsWindows() && windowsScript is not null)
         {
+            var launchScript = forExecution
+                ? PrepareWindowsRuntimeBatchScript(windowsScript)
+                : windowsScript;
+
             return new LaunchCommand(
                 "cmd.exe",
-                $"/d /c \"\"{windowsScript}\"\"",
+                $"/d /c \"\"{launchScript}\"\"",
                 LinURootPath,
                 Encoding.GetEncoding(932),
                 Encoding.GetEncoding(932),
-                $"cmd.exe /d /c \"{windowsScript}\"");
+                $"cmd.exe /d /c \"{launchScript}\"");
         }
 
         var shellScript = FindFirstExistingFile(LinURootPath, "testloop.generated.sh", "testloop.sh", "test_loop.sh");
@@ -1587,6 +1661,96 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         throw new FileNotFoundException("No runnable script found. Expected test_loop.bat, testloop.bat, or testloop.sh.");
+    }
+
+    private string PrepareWindowsRuntimeBatchScript(string sourceScriptPath)
+    {
+        var encoding = Encoding.GetEncoding(932);
+        var sourceLines = File.ReadAllLines(sourceScriptPath, encoding);
+        var runtimeLines = InstrumentWindowsLoopMarkers(sourceLines);
+        var runtimeScriptPath = Path.Combine(
+            RuntimeDirectoryPath,
+            $"{Path.GetFileNameWithoutExtension(sourceScriptPath)}.gui.generated.bat");
+
+        EnsureDirectoryForFile(runtimeScriptPath);
+        File.WriteAllLines(runtimeScriptPath, runtimeLines, encoding);
+        return runtimeScriptPath;
+    }
+
+    private static List<string> InstrumentWindowsLoopMarkers(IReadOnlyList<string> sourceLines)
+    {
+        if (sourceLines.Count == 0)
+        {
+            return [];
+        }
+
+        if (sourceLines.Any(line => line.IndexOf("[GUI-LOOP-START]", StringComparison.OrdinalIgnoreCase) >= 0))
+        {
+            return sourceLines.ToList();
+        }
+
+        var result = new List<string>(sourceLines.Count + 8);
+        var injectedAtLoop = false;
+
+        foreach (var line in sourceLines)
+        {
+            if (!injectedAtLoop && IsOuterLoopHeaderLine(line))
+            {
+                var indent = GetLeadingWhitespace(line) + "      ";
+                result.Add("SET GUI_LOOP_INDEX=0");
+                result.Add(line);
+                result.Add($"{indent}SET /A GUI_LOOP_INDEX=!GUI_LOOP_INDEX!+1");
+                result.Add($"{indent}ECHO [GUI-LOOP-START] !GUI_LOOP_INDEX!");
+                injectedAtLoop = true;
+                continue;
+            }
+
+            if (injectedAtLoop && IsOuterLoopIncrementLine(line))
+            {
+                var indent = GetLeadingWhitespace(line);
+                result.Add($"{indent}ECHO [GUI-LOOP-DONE] !GUI_LOOP_INDEX!");
+            }
+
+            result.Add(line);
+        }
+
+        return result;
+    }
+
+    private static bool IsOuterLoopHeaderLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        var trimmed = line.TrimStart();
+        return trimmed.StartsWith("FOR /F", StringComparison.OrdinalIgnoreCase)
+            && trimmed.IndexOf("KANJI_TABLE_I", StringComparison.OrdinalIgnoreCase) >= 0
+            && trimmed.IndexOf("DO (", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static bool IsOuterLoopIncrementLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        var trimmed = line.TrimStart();
+        return trimmed.StartsWith("SET /A M=", StringComparison.OrdinalIgnoreCase)
+            && trimmed.IndexOf("+1", StringComparison.Ordinal) >= 0;
+    }
+
+    private static string GetLeadingWhitespace(string line)
+    {
+        var index = 0;
+        while (index < line.Length && char.IsWhiteSpace(line[index]))
+        {
+            index++;
+        }
+
+        return index == 0 ? string.Empty : line[..index];
     }
 
     private Process BuildProcess(LaunchCommand launch)
@@ -1644,7 +1808,7 @@ public partial class MainWindowViewModel : ViewModelBase
             AppendLog(line, isError, false);
             LastOutputTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             LastOutputAgeSeconds = 0;
-            OutputActivity = "active";
+            OutputActivity = GetOutputActivityText(isActive: true);
             UpdateRealtimeProgressFromOutput(normalizedLine);
 
             var failureDetected = IsFailureOutputLine(normalizedLine);
@@ -1683,10 +1847,12 @@ public partial class MainWindowViewModel : ViewModelBase
             _firstFailureLine = line.Trim();
             RunResult = "FAIL";
             VerdictText = "FAIL";
-            VerdictReason = $"Failure detected in output: {_firstFailureLine}";
+            VerdictReason = IsJapaneseUiLanguage()
+                ? $"\u51FA\u529B\u3067\u30A8\u30E9\u30FC\u3092\u691C\u51FA: {_firstFailureLine}"
+                : $"Failure detected in output: {_firstFailureLine}";
             StatusText = RunningProcessId > 0
-                ? $"Running with failures (PID {RunningProcessId})"
-                : "Running with failures";
+                ? FormatRunningWithFailuresStatus(RunningProcessId)
+                : LocalizeText("\u30A8\u30E9\u30FC\u691C\u51FA\u4E2D\u3067\u5B9F\u884C\u4E2D", "Running with failures");
             AppendLog("[GUI] Failure detected in output. Verdict switched to FAIL.", true, true);
             _ = AppendRunLogLineAsync("[GUI] Failure detected in output. Verdict switched to FAIL.");
             return;
@@ -1706,8 +1872,10 @@ public partial class MainWindowViewModel : ViewModelBase
         _stopRequested = true;
         RunResult = "STOPPING";
         VerdictText = "FAIL";
-        VerdictReason = $"Stopping on first error: {CompactLine(reasonLine)}";
-        StatusText = "Stopping on first error...";
+        VerdictReason = IsJapaneseUiLanguage()
+            ? $"\u6700\u521D\u306E\u30A8\u30E9\u30FC\u3067\u505C\u6B62: {CompactLine(reasonLine)}"
+            : $"Stopping on first error: {CompactLine(reasonLine)}";
+        StatusText = LocalizeText("\u6700\u521D\u306E\u30A8\u30E9\u30FC\u3067\u505C\u6B62\u4E2D...", "Stopping on first error...");
         AppendLog("[GUI] Stop requested automatically due to first error.", true, true);
         await AppendRunLogLineAsync("[GUI] Stop requested automatically due to first error.");
 
@@ -1834,7 +2002,7 @@ public partial class MainWindowViewModel : ViewModelBase
             var nowUtc = DateTime.UtcNow;
             var elapsed = nowUtc - _runStartedUtc;
             var outputAgeSeconds = Math.Max(0, (int)(nowUtc - _lastOutputUtc).TotalSeconds);
-            var outputState = outputAgeSeconds > 2 ? "idle" : "active";
+            var outputState = GetOutputActivityText(outputAgeSeconds <= 2);
 
             Dispatcher.UIThread.Post(() =>
             {
@@ -1846,6 +2014,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 ElapsedTime = elapsed.ToString(@"hh\:mm\:ss");
                 LastOutputAgeSeconds = outputAgeSeconds;
                 OutputActivity = outputState;
+                UpdateEstimatedTimeDisplay(elapsed);
             });
         }
     }
@@ -1948,7 +2117,7 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         ProgressPercentage = 100;
-        ProgressText = "1 / 1 (100.0%)";
+        UpdateProgressTextDisplay();
     }
 
     private void UpdateRealtimeProgressFromOutput(string line)
@@ -1962,6 +2131,8 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             LoopStartedCount = 1;
         }
+
+        TryApplyGuiLoopMarker(line);
 
         if (TryParseSummaryCounts(line, out var successCount, out var failureCount))
         {
@@ -1983,7 +2154,107 @@ public partial class MainWindowViewModel : ViewModelBase
         if (nextProgress > ProgressPercentage)
         {
             ProgressPercentage = nextProgress;
-            ProgressText = $"{Math.Min(LoopCompletedCount, ConfiguredLoopCount)} / {ConfiguredLoopCount} ({ProgressPercentage:0.0}%)";
+        }
+
+        UpdateProgressTextDisplay();
+        UpdateEstimatedTimeDisplay(DateTime.UtcNow - _runStartedUtc);
+    }
+
+    private void UpdateProgressTextDisplay()
+    {
+        if (ConfiguredLoopCount <= 0)
+        {
+            ProgressText = "0 / 0 (0.0%)";
+            return;
+        }
+
+        var completed = Math.Min(LoopCompletedCount, ConfiguredLoopCount);
+        ProgressText = $"{completed} / {ConfiguredLoopCount} ({ProgressPercentage:0.0}%)";
+    }
+
+    private void UpdateEstimatedTimeDisplay(TimeSpan elapsed)
+    {
+        var progress = Math.Clamp(ProgressPercentage, 0.0, 100.0);
+        if (progress <= 0.01)
+        {
+            EstimatedRemaining = "-";
+            EstimatedFinishTime = "-";
+            return;
+        }
+
+        if (progress >= 99.9)
+        {
+            EstimatedRemaining = "00:00:00";
+            EstimatedFinishTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            return;
+        }
+
+        var elapsedSeconds = Math.Max(1.0, elapsed.TotalSeconds);
+        var estimatedTotalSeconds = elapsedSeconds * (100.0 / progress);
+        var remainingSeconds = Math.Max(0.0, estimatedTotalSeconds - elapsedSeconds);
+        if (double.IsNaN(remainingSeconds) || double.IsInfinity(remainingSeconds) || remainingSeconds > TimeSpan.FromDays(30).TotalSeconds)
+        {
+            EstimatedRemaining = "-";
+            EstimatedFinishTime = "-";
+            return;
+        }
+
+        var remaining = TimeSpan.FromSeconds(remainingSeconds);
+        EstimatedRemaining = FormatDurationForDisplay(remaining);
+        EstimatedFinishTime = DateTime.Now.Add(remaining).ToString("yyyy-MM-dd HH:mm:ss");
+    }
+
+    private static string FormatDurationForDisplay(TimeSpan duration)
+    {
+        if (duration < TimeSpan.Zero)
+        {
+            duration = TimeSpan.Zero;
+        }
+
+        var totalHours = (int)Math.Floor(duration.TotalHours);
+        return $"{totalHours:00}:{duration.Minutes:00}:{duration.Seconds:00}";
+    }
+
+    private void TryApplyGuiLoopMarker(string line)
+    {
+        var match = GuiLoopMarkerRegex.Match(line);
+        if (!match.Success)
+        {
+            return;
+        }
+
+        var markerType = match.Groups["type"].Value.ToUpperInvariant();
+        var hasIndex = int.TryParse(match.Groups["index"].Value, out var parsedIndex) && parsedIndex > 0;
+        var markerIndex = hasIndex ? parsedIndex : 0;
+
+        switch (markerType)
+        {
+            case "START":
+            {
+                var started = hasIndex ? markerIndex : LoopStartedCount + 1;
+                LoopStartedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopStartedCount, started));
+                break;
+            }
+            case "DONE":
+            {
+                var completed = hasIndex ? markerIndex : LoopCompletedCount + 1;
+                LoopCompletedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopCompletedCount, completed));
+                LoopStartedCount = Math.Max(LoopStartedCount, LoopCompletedCount);
+                break;
+            }
+            case "FAIL":
+            {
+                var failed = hasIndex ? markerIndex : LoopFailedCount + 1;
+                LoopFailedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopFailedCount, failed));
+                LoopStartedCount = Math.Max(LoopStartedCount, LoopFailedCount);
+                break;
+            }
+        }
+
+        var markerProgress = (Math.Min(LoopCompletedCount, ConfiguredLoopCount) * 100.0) / ConfiguredLoopCount;
+        if (markerProgress > ProgressPercentage)
+        {
+            ProgressPercentage = markerProgress;
         }
     }
 
@@ -2135,16 +2406,24 @@ public partial class MainWindowViewModel : ViewModelBase
             sb.Append(' ');
         }
 
-        sb.Append($"Process exited with code {exitCode}.");
+        if (IsJapaneseUiLanguage())
+        {
+            sb.Append($"\u30D7\u30ED\u30BB\u30B9\u306F exit code {exitCode} \u3067\u7D42\u4E86\u3057\u307E\u3057\u305F\u3002");
+        }
+        else
+        {
+            sb.Append($"Process exited with code {exitCode}.");
+        }
+
         if (!string.IsNullOrWhiteSpace(line))
         {
-            sb.Append(" Last error line: ");
+            sb.Append(IsJapaneseUiLanguage() ? " \u6700\u7D42\u30A8\u30E9\u30FC\u884C: " : " Last error line: ");
             sb.Append(CompactLine(line));
         }
 
         if (!string.IsNullOrWhiteSpace(hint))
         {
-            sb.Append(" Hint: ");
+            sb.Append(IsJapaneseUiLanguage() ? " \u30D2\u30F3\u30C8: " : " Hint: ");
             sb.Append(hint);
         }
 
@@ -2155,16 +2434,19 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         var line = GetMostRelevantFailureLine();
         var hint = InferConfigurationHint(line);
-        var sb = new StringBuilder("Failure detected in output.");
+        var sb = new StringBuilder(
+            IsJapaneseUiLanguage()
+                ? "\u51FA\u529B\u304B\u3089\u30A8\u30E9\u30FC\u3092\u691C\u51FA\u3057\u307E\u3057\u305F\u3002"
+                : "Failure detected in output.");
         if (!string.IsNullOrWhiteSpace(line))
         {
-            sb.Append(" Last error line: ");
+            sb.Append(IsJapaneseUiLanguage() ? " \u6700\u7D42\u30A8\u30E9\u30FC\u884C: " : " Last error line: ");
             sb.Append(CompactLine(line));
         }
 
         if (!string.IsNullOrWhiteSpace(hint))
         {
-            sb.Append(" Hint: ");
+            sb.Append(IsJapaneseUiLanguage() ? " \u30D2\u30F3\u30C8: " : " Hint: ");
             sb.Append(hint);
         }
 
@@ -2191,7 +2473,7 @@ public partial class MainWindowViewModel : ViewModelBase
         return string.Empty;
     }
 
-    private static string InferConfigurationHint(string line)
+    private string InferConfigurationHint(string line)
     {
         if (string.IsNullOrWhiteSpace(line))
         {
@@ -2209,7 +2491,9 @@ public partial class MainWindowViewModel : ViewModelBase
             || lower.Contains("login failed", StringComparison.Ordinal)
             || lower.Contains("401", StringComparison.Ordinal))
         {
-            return "Check QAV_USER/QAV_PASS and VAL_USER/VAL_PASS.";
+            return LocalizeText(
+                "QAV_USER/QAV_PASS \u304A\u3088\u3073 VAL_USER/VAL_PASS \u3092\u78BA\u8A8D\u3057\u3066\u304F\u3060\u3055\u3044\u3002",
+                "Check QAV_USER/QAV_PASS and VAL_USER/VAL_PASS.");
         }
 
         if (lower.Contains("could not resolve", StringComparison.Ordinal)
@@ -2217,7 +2501,9 @@ public partial class MainWindowViewModel : ViewModelBase
             || lower.Contains("no such host", StringComparison.Ordinal)
             || lower.Contains("host not found", StringComparison.Ordinal))
         {
-            return "Check QAV_SERVER / VAL_SERVER host names.";
+            return LocalizeText(
+                "QAV_SERVER / VAL_SERVER \u306E\u30DB\u30B9\u30C8\u540D\u3092\u78BA\u8A8D\u3057\u3066\u304F\u3060\u3055\u3044\u3002",
+                "Check QAV_SERVER / VAL_SERVER host names.");
         }
 
         if (lower.Contains("connection refused", StringComparison.Ordinal)
@@ -2226,21 +2512,27 @@ public partial class MainWindowViewModel : ViewModelBase
             || lower.Contains("timeout", StringComparison.Ordinal)
             || lower.Contains("failed to connect", StringComparison.Ordinal))
         {
-            return "Check server address/port and whether the server is running.";
+            return LocalizeText(
+                "\u30B5\u30FC\u30D0\u30FC\u306E\u30A2\u30C9\u30EC\u30B9/\u30DD\u30FC\u30C8\u3068\u30B5\u30FC\u30D0\u30FC\u8D77\u52D5\u72B6\u614B\u3092\u78BA\u8A8D\u3057\u3066\u304F\u3060\u3055\u3044\u3002",
+                "Check server address/port and whether the server is running.");
         }
 
         if (lower.Contains("qacli is not recognized", StringComparison.Ordinal)
             || lower.Contains("qacli: command not found", StringComparison.Ordinal)
             || lower.Contains("not recognized as an internal or external command", StringComparison.Ordinal))
         {
-            return "Check QACLI_BIN. qacli executable may not be found.";
+            return LocalizeText(
+                "QACLI_BIN \u3092\u78BA\u8A8D\u3057\u3066\u304F\u3060\u3055\u3044\u3002qacli \u5B9F\u884C\u30D5\u30A1\u30A4\u30EB\u304C\u898B\u3064\u304B\u3089\u306A\u3044\u53EF\u80FD\u6027\u304C\u3042\u308A\u307E\u3059\u3002",
+                "Check QACLI_BIN. qacli executable may not be found.");
         }
 
         if (lower.Contains("the system cannot find the path specified", StringComparison.Ordinal)
             || lower.Contains("path not found", StringComparison.Ordinal)
             || lower.Contains("no such file or directory", StringComparison.Ordinal))
         {
-            return "Check TEST_ROOT / QAF_ROOT / QACLI_BIN paths.";
+            return LocalizeText(
+                "TEST_ROOT / QAF_ROOT / QACLI_BIN \u306E\u30D1\u30B9\u3092\u78BA\u8A8D\u3057\u3066\u304F\u3060\u3055\u3044\u3002",
+                "Check TEST_ROOT / QAF_ROOT / QACLI_BIN paths.");
         }
 
         return string.Empty;
@@ -2538,7 +2830,7 @@ public partial class MainWindowViewModel : ViewModelBase
         ExtractedErrorCount = ErrorFindings.Sum(x => Math.Max(1, x.Occurrences));
     }
 
-    private static bool TryDescribeError(string line, out ErrorInsight insight)
+    private bool TryDescribeError(string line, out ErrorInsight insight)
     {
         insight = default!;
         if (string.IsNullOrWhiteSpace(line))
@@ -2564,9 +2856,9 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             var componentName = componentMatch.Groups["name"].Value;
             insight = new ErrorInsight(
-                "Component Version Mismatch",
-                $"Component '{componentName}' is not available in this QAC installation.",
-                "Match COM_* values to the available component versions listed by qacli.");
+                LocalizeText("コンポーネント不一致", "Component Version Mismatch"),
+                IsJapaneseUiLanguage() ? $"コンポーネント '{componentName}' は、このQAC環境では利用できません。" : $"Component '{componentName}' is not available in this QAC installation.",
+                LocalizeText("qacli で確認できるコンポーネントバージョンに COM_* を合わせてください。", "Match COM_* values to the available component versions listed by qacli."));
             return true;
         }
 
@@ -2574,13 +2866,13 @@ public partial class MainWindowViewModel : ViewModelBase
             || normalized.Contains("parse error", StringComparison.OrdinalIgnoreCase))
         {
             var hint = normalized.Contains("-t (--type)", StringComparison.Ordinal)
-                ? "Review qacli view -t value (tool version may not support the given type)."
+                ? LocalizeText("qacli view -t の値を確認してください（ツールバージョンにより未対応の種別の可能性があります）。", "Review qacli view -t value (tool version may not support the given type).")
                 : normalized.Contains("-m (--medium)", StringComparison.Ordinal)
-                    ? "Review qacli view -m value (allowed media differ by tool version)."
-                    : "Review command options for the installed qacli version.";
+                    ? LocalizeText("qacli view -m の値を確認してください（ツールバージョンで許容メディアが異なる可能性があります）。", "Review qacli view -m value (allowed media differ by tool version).")
+                    : LocalizeText("インストール済みの qacli バージョンに対してコマンドオプションを見直してください。", "Review command options for the installed qacli version.");
             insight = new ErrorInsight(
-                "CLI Parse Error",
-                "Command arguments are not accepted by the current qacli.",
+                LocalizeText("CLIパースエラー", "CLI Parse Error"),
+                LocalizeText("コマンド引数が現在の qacli では受け付けられません。", "Command arguments are not accepted by the current qacli."),
                 hint);
             return true;
         }
@@ -2592,9 +2884,9 @@ public partial class MainWindowViewModel : ViewModelBase
                 || normalized.Contains(".hpp", StringComparison.OrdinalIgnoreCase)))
         {
             insight = new ErrorInsight(
-                "Include Path Error",
-                "Required header file could not be resolved during analysis.",
-                "Check project include path settings and SOURCE_ROOT resolution.");
+                LocalizeText("インクルードパスエラー", "Include Path Error"),
+                LocalizeText("解析時に必要なヘッダーファイルを解決できませんでした。", "Required header file could not be resolved during analysis."),
+                LocalizeText("プロジェクトの include path 設定と SOURCE_ROOT 解決結果を確認してください。", "Check project include path settings and SOURCE_ROOT resolution."));
             return true;
         }
 
@@ -2604,9 +2896,9 @@ public partial class MainWindowViewModel : ViewModelBase
             || normalized.Contains("forbidden", StringComparison.OrdinalIgnoreCase))
         {
             insight = new ErrorInsight(
-                "Authentication Error",
-                "Authentication/token setup failed for QAV/Validate.",
-                "Check server URL, user, password, and permission scope.");
+                LocalizeText("認証エラー", "Authentication Error"),
+                LocalizeText("QAV/Validate の認証またはトークン設定に失敗しました。", "Authentication/token setup failed for QAV/Validate."),
+                LocalizeText("サーバーURL・ユーザー・パスワード・権限スコープを確認してください。", "Check server URL, user, password, and permission scope."));
             return true;
         }
 
@@ -2617,12 +2909,12 @@ public partial class MainWindowViewModel : ViewModelBase
             var hint = InferConfigurationHint(normalized);
             if (string.IsNullOrWhiteSpace(hint))
             {
-                hint = "Open the referenced qacli log and check the command just before this error.";
+                hint = LocalizeText("参照された qacli ログを開き、このエラー直前のコマンドを確認してください。", "Open the referenced qacli log and check the command just before this error.");
             }
 
             insight = new ErrorInsight(
-                "Runtime Error",
-                "A runtime failure indicator was detected in the test output.",
+                LocalizeText("実行時エラー", "Runtime Error"),
+                LocalizeText("テスト出力で実行時失敗の兆候を検出しました。", "A runtime failure indicator was detected in the test output."),
                 hint);
             return true;
         }
@@ -3006,3 +3298,4 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs("Item"));
     }
 }
+

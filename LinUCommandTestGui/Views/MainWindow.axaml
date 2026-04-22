@@ -192,7 +192,7 @@
                     <StackPanel Spacing="8">
                         <TextBlock FontWeight="Bold" Text="{Binding T[SectionRunControl]}" />
                         <WrapPanel>
-                            <Button Command="{Binding PrecheckSettingsCommand}" Content="{Binding T[Precheck]}" Margin="0,0,8,0" />
+                            <Button Command="{Binding PrecheckSettingsCommand}" Content="{Binding PrecheckButtonText}" Margin="0,0,8,0" />
                             <Button Command="{Binding StartTestCommand}" Content="{Binding T[StartTest]}" Margin="0,0,8,0" />
                             <Button Command="{Binding StopTestCommand}" Content="{Binding T[Stop]}" Margin="0,0,8,0" />
                             <Button Command="{Binding ClearLogsCommand}" Content="{Binding T[ClearGuiLog]}" />
@@ -251,7 +251,7 @@
                             <TextBlock Text="{Binding LastOutputTime}" Margin="0,0,14,0" />
                             <TextBlock Text="{Binding T[LastOutputAge]}" Margin="0,0,6,0" />
                             <TextBlock Text="{Binding LastOutputAgeSeconds}" />
-                            <TextBlock Text="s" />
+                            <TextBlock Text="{Binding SecondUnitText}" />
                         </WrapPanel>
                         <WrapPanel>
                             <TextBlock Text="{Binding T[LoopStarted]}" Margin="0,0,6,0" />
@@ -313,10 +313,10 @@
                             </Grid>
                         </TabItem>
 
-                        <TabItem Header="{Binding T[SectionErrorAnalysis]}">
+                        <TabItem Header="{Binding ErrorAnalysisTabTitle}">
                             <Grid RowDefinitions="Auto,*" RowSpacing="8">
                                 <WrapPanel Grid.Row="0">
-                                    <TextBlock Text="{Binding T[ExtractedErrorCount]}" Margin="0,0,8,0" />
+                                    <TextBlock Text="{Binding ExtractedErrorCountLabel}" Margin="0,0,8,0" />
                                     <TextBlock Text="{Binding ExtractedErrorCount}" FontWeight="Bold" />
                                 </WrapPanel>
 
@@ -328,23 +328,23 @@
                                                     <StackPanel Spacing="4">
                                                         <TextBlock Foreground="#D12F2F" FontWeight="SemiBold" Text="{Binding ErrorText}" TextWrapping="Wrap" />
                                                         <WrapPanel>
-                                                            <TextBlock Text="Category" Margin="0,0,6,0" />
+                                                            <TextBlock Text="{Binding $parent[Window].DataContext.ErrorCategoryLabel}" Margin="0,0,6,0" />
                                                             <TextBlock Text="{Binding Category}" FontWeight="SemiBold" />
-                                                            <TextBlock Margin="14,0,6,0" Text="Occurrences" />
+                                                            <TextBlock Margin="14,0,6,0" Text="{Binding $parent[Window].DataContext.ErrorOccurrencesLabel}" />
                                                             <TextBlock Text="{Binding Occurrences}" FontWeight="SemiBold" />
                                                         </WrapPanel>
                                                         <WrapPanel>
-                                                            <TextBlock Text="First Seen" Margin="0,0,6,0" />
+                                                            <TextBlock Text="{Binding $parent[Window].DataContext.ErrorFirstSeenLabel}" Margin="0,0,6,0" />
                                                             <TextBlock Text="{Binding FirstSeenTime}" />
-                                                            <TextBlock Margin="14,0,6,0" Text="Last Seen" />
+                                                            <TextBlock Margin="14,0,6,0" Text="{Binding $parent[Window].DataContext.ErrorLastSeenLabel}" />
                                                             <TextBlock Text="{Binding LastSeenTime}" />
                                                         </WrapPanel>
                                                         <WrapPanel>
-                                                            <TextBlock Text="Explanation" Margin="0,0,6,0" />
+                                                            <TextBlock Text="{Binding $parent[Window].DataContext.ErrorExplanationLabel}" Margin="0,0,6,0" />
                                                             <TextBlock Text="{Binding Explanation}" TextWrapping="Wrap" />
                                                         </WrapPanel>
                                                         <WrapPanel>
-                                                            <TextBlock Text="Hint" Margin="0,0,6,0" />
+                                                            <TextBlock Text="{Binding $parent[Window].DataContext.ErrorHintLabel}" Margin="0,0,6,0" />
                                                             <TextBlock Text="{Binding Hint}" TextWrapping="Wrap" />
                                                         </WrapPanel>
                                                     </StackPanel>
