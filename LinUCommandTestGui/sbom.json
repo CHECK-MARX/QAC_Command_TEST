@@ -1,0 +1,96 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:1ff6d835-0a29-4b28-98c2-qac-command-test-sbom",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "bom-ref": "pkg:generic/LinUCommandTestGui@0.0.0",
+      "name": "LinUCommandTestGui",
+      "version": "0.0.0",
+      "purl": "pkg:generic/LinUCommandTestGui@0.0.0"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "pkg:nuget/Avalonia@12.0.1",
+      "name": "Avalonia",
+      "version": "12.0.1",
+      "purl": "pkg:nuget/Avalonia@12.0.1"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:nuget/Avalonia.Desktop@12.0.1",
+      "name": "Avalonia.Desktop",
+      "version": "12.0.1",
+      "purl": "pkg:nuget/Avalonia.Desktop@12.0.1"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:nuget/Avalonia.Themes.Fluent@12.0.1",
+      "name": "Avalonia.Themes.Fluent",
+      "version": "12.0.1",
+      "purl": "pkg:nuget/Avalonia.Themes.Fluent@12.0.1"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:nuget/Avalonia.Fonts.Inter@12.0.1",
+      "name": "Avalonia.Fonts.Inter",
+      "version": "12.0.1",
+      "purl": "pkg:nuget/Avalonia.Fonts.Inter@12.0.1"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:nuget/AvaloniaUI.DiagnosticsSupport@2.2.1",
+      "name": "AvaloniaUI.DiagnosticsSupport",
+      "version": "2.2.1",
+      "purl": "pkg:nuget/AvaloniaUI.DiagnosticsSupport@2.2.1"
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:nuget/CommunityToolkit.Mvvm@8.4.1",
+      "name": "CommunityToolkit.Mvvm",
+      "version": "8.4.1",
+      "purl": "pkg:nuget/CommunityToolkit.Mvvm@8.4.1"
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "pkg:generic/LinUCommandTestGui@0.0.0",
+      "dependsOn": [
+        "pkg:nuget/Avalonia@12.0.1",
+        "pkg:nuget/Avalonia.Desktop@12.0.1",
+        "pkg:nuget/Avalonia.Themes.Fluent@12.0.1",
+        "pkg:nuget/Avalonia.Fonts.Inter@12.0.1",
+        "pkg:nuget/AvaloniaUI.DiagnosticsSupport@2.2.1",
+        "pkg:nuget/CommunityToolkit.Mvvm@8.4.1"
+      ]
+    },
+    {
+      "ref": "pkg:nuget/Avalonia@12.0.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:nuget/Avalonia.Desktop@12.0.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:nuget/Avalonia.Themes.Fluent@12.0.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:nuget/Avalonia.Fonts.Inter@12.0.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:nuget/AvaloniaUI.DiagnosticsSupport@2.2.1",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:nuget/CommunityToolkit.Mvvm@8.4.1",
+      "dependsOn": []
+    }
+  ]
+}
