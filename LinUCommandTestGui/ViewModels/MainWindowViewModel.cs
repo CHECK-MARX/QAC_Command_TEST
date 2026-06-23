@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -216,6 +217,21 @@ public partial class MainWindowViewModel : ViewModelBase
     private DateTime _lastOutputUtc = DateTime.UtcNow;
     private DateTime _lastAutoConfirmSentUtc = DateTime.MinValue;
     private int _observedOutputLineCount;
+    private int _estimatedCommandsPerLoop;
+    private int _estimatedFixedCommandCount;
+    private int _estimatedTotalCommandCount;
+    private int _completedCommandCount;
+    private int _historicalCommandSampleCount;
+    private readonly Dictionary<int, double> _historicalAverageSecondsByCommandIndex = new();
+    private readonly Dictionary<int, string> _commandDescriptionByIndex = new();
+    private readonly Dictionary<string, DateTime> _activeCommandStartUtcByKey = new(StringComparer.Ordinal);
+    private readonly Queue<double> _recentCommandDurationSeconds = new();
+    private readonly Dictionary<int, DateTime> _loopStartedUtcByIndex = new();
+    private readonly Queue<double> _recentLoopDurationSeconds = new();
+    private bool _hasActiveRunLog;
+    private DateTime _lastEtaSnapshotUtc = DateTime.MinValue;
+    private double _lastEtaPromptDelayBiasSeconds;
+    private CancellationTokenSource? _processExitWaitCts;
     private CancellationTokenSource? _autoConfirmLoopCts;
     private Task? _autoConfirmLoopTask;
     private CancellationTokenSource? _runtimeStatusLoopCts;
@@ -236,7 +252,16 @@ public partial class MainWindowViewModel : ViewModelBase
         @"(?<success>\d+)\s+success(?:es)?\s*(?:and|,)\s*(?<failed>\d+)\s+fail(?:ed|ures?)?",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex GuiLoopMarkerRegex = new(
-        @"^\[GUI-LOOP-(?<type>START|DONE|FAIL)\]\s*(?<index>\d+)?",
+        @"\[GUI-LOOP-(?<type>START|DONE|FAIL)\]\s*(?<index>\d+)?",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex GuiCommandStartMarkerRegex = new(
+        @"\[GUI-CMD-START\]\s+L(?<loop>\d*)#(?<cmd>\d+)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex GuiCommandEndMarkerRegex = new(
+        @"\[GUI-CMD-END\]\s+L(?<loop>\d*)#(?<cmd>\d+)\s+RC=(?<rc>-?\d+)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex CommandTimingLogRegex = new(
+        @"^\[CMD-TIME\]\s+loop=(?<loop>\d+)\s+cmd=(?<cmd>\d+)\s+elapsed=(?<elapsed>\d{2}:\d{2}:\d{2}\.\d{3})\s+rc=(?<rc>-?\d+)\b",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly string[] TrackedEnvironmentKeys =
     [
@@ -579,6 +604,7 @@ public partial class MainWindowViewModel : ViewModelBase
             _stopRequested = false;
             _stopRequestedByUser = false;
             _failureDetectedDuringRun = false;
+            _hasActiveRunLog = false;
             _firstFailureLine = string.Empty;
             _lastOutputLine = string.Empty;
             _lastErrorHintLine = string.Empty;
@@ -586,8 +612,18 @@ public partial class MainWindowViewModel : ViewModelBase
             _lastAutoConfirmSentUtc = DateTime.MinValue;
             _observedOutputLineCount = 0;
             _runStartedUtc = DateTime.UtcNow;
+            _completedCommandCount = 0;
+            _activeCommandStartUtcByKey.Clear();
+            _recentCommandDurationSeconds.Clear();
+            _loopStartedUtcByIndex.Clear();
+            _recentLoopDurationSeconds.Clear();
+            _historicalAverageSecondsByCommandIndex.Clear();
+            _historicalCommandSampleCount = 0;
+            _lastEtaSnapshotUtc = DateTime.MinValue;
             RunningProcessId = 0;
             ConfiguredLoopCount = Math.Max(1, SelectedPairCount);
+            _estimatedTotalCommandCount = Math.Max(0, _estimatedFixedCommandCount + (_estimatedCommandsPerLoop * ConfiguredLoopCount));
+            LoadHistoricalTimingProfile();
             LoopStartedCount = 0;
             LoopCompletedCount = 0;
             LoopFailedCount = 0;
@@ -603,7 +639,7 @@ public partial class MainWindowViewModel : ViewModelBase
             VerdictText = "RUNNING";
             VerdictReason = LocalizeText("\u30C6\u30B9\u30C8\u5B9F\u884C\u4E2D\u3067\u3059\u3002", "Test is running.");
             ProgressPercentage = 0;
-            ProgressText = $"0 / {ConfiguredLoopCount} (0.0%)";
+            UpdateProgressTextDisplay();
             EstimatedRemaining = "-";
             EstimatedFinishTime = "-";
             ElapsedTime = "00:00:00";
@@ -613,8 +649,13 @@ public partial class MainWindowViewModel : ViewModelBase
 
             Directory.CreateDirectory(OutputLogDirectoryPath);
             await File.WriteAllTextAsync(CurrentRunLogPath, string.Empty, new UTF8Encoding(false));
+            _hasActiveRunLog = true;
             AppendLog("[GUI] Start requested.", false, true);
             await AppendRunLogLineAsync("[GUI] Start requested.");
+            await AppendRunLogLineAsync(
+                $"[RUN-META] loops={ConfiguredLoopCount} fixed_commands={_estimatedFixedCommandCount} commands_per_loop={_estimatedCommandsPerLoop} estimated_total_commands={_estimatedTotalCommandCount} prompt_delay_ms={PromptDelayMilliseconds} auto_confirm={AutoConfirmPrompts}");
+            await AppendRunLogLineAsync(
+                $"[RUN-META] historical_command_samples={_historicalCommandSampleCount} historical_profile_entries={_historicalAverageSecondsByCommandIndex.Count}");
 
             var process = BuildProcess(launch);
             _runningProcess = process;
@@ -635,7 +676,7 @@ public partial class MainWindowViewModel : ViewModelBase
             process.BeginErrorReadLine();
             StartAutoConfirmLoop();
             StartRuntimeStatusLoop();
-            await process.WaitForExitAsync();
+            var processExited = await WaitForManagedProcessExitAsync(process);
 
             try
             {
@@ -647,7 +688,8 @@ public partial class MainWindowViewModel : ViewModelBase
                 // Ignore cancellation exceptions after process exit.
             }
 
-            var exitCode = process.ExitCode;
+            var hasExited = processExited || TryGetProcessHasExited(process, out var exitedState) && exitedState;
+            var exitCode = hasExited ? TryGetProcessExitCode(process, fallback: -1) : -1;
             ElapsedTime = (DateTime.UtcNow - _runStartedUtc).ToString(@"hh\:mm\:ss");
             OutputActivity = GetOutputActivityText(isActive: false);
 
@@ -655,10 +697,24 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 RunResult = "STOPPED";
                 VerdictText = "STOPPED";
-                VerdictReason = LocalizeText("\u30E6\u30FC\u30B6\u30FC\u306B\u3088\u308A\u505C\u6B62\u3055\u308C\u307E\u3057\u305F\u3002", "Stopped by user.");
-                StatusText = LocalizeText("\u505C\u6B62\u3057\u307E\u3057\u305F\u3002", "Stopped.");
-                AppendLog($"[GUI] Process stopped by user (exit code {exitCode}).", false, true);
-                await AppendRunLogLineAsync($"[GUI] Process stopped by user (exit code {exitCode}).");
+                if (hasExited)
+                {
+                    VerdictReason = LocalizeText("\u30E6\u30FC\u30B6\u30FC\u306B\u3088\u308A\u505C\u6B62\u3055\u308C\u307E\u3057\u305F\u3002", "Stopped by user.");
+                    StatusText = LocalizeText("\u505C\u6B62\u3057\u307E\u3057\u305F\u3002", "Stopped.");
+                    AppendLog($"[GUI] Process stopped by user (exit code {exitCode}).", false, true);
+                    await AppendRunLogLineAsync($"[GUI] Process stopped by user (exit code {exitCode}).");
+                }
+                else
+                {
+                    VerdictReason = LocalizeText(
+                        "\u30E6\u30FC\u30B6\u30FC\u505C\u6B62\u8981\u6C42\u3092\u53D7\u3051\u4ED8\u3051\u307E\u3057\u305F\u304C\u3001\u30D7\u30ED\u30BB\u30B9\u7D42\u4E86\u5F85\u3061\u304C\u8D85\u6642\u3057\u305F\u305F\u3081GUI\u3092\u505C\u6B62\u72B6\u614B\u306B\u79FB\u884C\u3057\u307E\u3057\u305F\u3002",
+                        "Stop request accepted, but process exit wait timed out. GUI was moved to stopped state.");
+                    StatusText = LocalizeText("\u505C\u6B62\u5F85\u3061\u8D85\u6642 (GUI \u505C\u6B62\u6271\u3044)", "Stop wait timed out (GUI stopped).");
+                    AppendLog("[GUI] Stop wait timed out. GUI moved to stopped state.", true, true);
+                    await AppendRunLogLineAsync("[GUI] Stop wait timed out. GUI moved to stopped state.");
+                }
+
+                SetCompletionEtaNow();
                 return;
             }
 
@@ -677,6 +733,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 StatusText = LocalizeText("\u6700\u521D\u306E\u30A8\u30E9\u30FC\u3067\u505C\u6B62\u3057\u307E\u3057\u305F\u3002", "Stopped on first error.");
                 AppendLog($"[ERR] {reason}", true, false);
                 await AppendRunLogLineAsync($"[ERR] {reason}");
+                SetCompletionEtaNow();
                 return;
             }
 
@@ -705,6 +762,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 StatusText = LocalizeText("\u5B8C\u4E86\u3057\u307E\u3057\u305F\u3002", "Completed.");
                 AppendLog("[GUI] Completed.", false, true);
                 await AppendRunLogLineAsync("[GUI] Completed.");
+                SetCompletionEtaNow();
             }
             else
             {
@@ -723,6 +781,7 @@ public partial class MainWindowViewModel : ViewModelBase
                     : LocalizeText("\u30A8\u30E9\u30FC\u691C\u51FA\u3067\u5B8C\u4E86\u3057\u307E\u3057\u305F\u3002", "Completed with errors.");
                 AppendLog($"[ERR] {reason}", true, false);
                 await AppendRunLogLineAsync($"[ERR] {reason}");
+                SetCompletionEtaNow();
             }
         }
         catch (Exception ex)
@@ -734,13 +793,18 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         finally
         {
+            await AppendRunTelemetrySummaryAsync();
             await StopRuntimeStatusLoopAsync();
             await StopAutoConfirmLoopAsync();
+            CancelProcessExitWait();
+            _processExitWaitCts?.Dispose();
+            _processExitWaitCts = null;
             _runningProcess?.Dispose();
             _runningProcess = null;
             IsRunning = false;
             IsPaused = false;
             RunningProcessId = 0;
+            _hasActiveRunLog = false;
         }
     }
 
@@ -814,10 +878,23 @@ public partial class MainWindowViewModel : ViewModelBase
         RunResult = "STOPPING";
         VerdictText = "STOPPING";
         VerdictReason = LocalizeText("\u30E6\u30FC\u30B6\u30FC\u304C\u505C\u6B62\u3092\u8981\u6C42\u3057\u307E\u3057\u305F\u3002", "Stop requested by user.");
+        StopTestCommand.NotifyCanExecuteChanged();
         AppendLog("[GUI] Stop requested by user.", false, true);
         await AppendRunLogLineAsync("[GUI] Stop requested by user.");
 
+        CancelProcessExitWait();
         await KillProcessTreeAsync(_runningProcess.Id);
+        if (!TryGetProcessHasExited(_runningProcess, out var hasExited) || !hasExited)
+        {
+            try
+            {
+                _runningProcess.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // Ignore best-effort force kill failures.
+            }
+        }
     }
 
     [RelayCommand]
@@ -840,7 +917,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private bool CanStopTest()
     {
-        return IsRunning;
+        return IsRunning && !_stopRequestedByUser;
     }
 
     private async Task<string?> LoadEnvironmentFromSourceScriptAsync()
@@ -1651,6 +1728,9 @@ public partial class MainWindowViewModel : ViewModelBase
         var shellScript = FindFirstExistingFile(LinURootPath, "testloop.generated.sh", "testloop.sh", "test_loop.sh");
         if (shellScript is not null)
         {
+            _estimatedCommandsPerLoop = 0;
+            _estimatedFixedCommandCount = 0;
+            _commandDescriptionByIndex.Clear();
             return new LaunchCommand(
                 "bash",
                 $"\"{shellScript}\"",
@@ -1667,7 +1747,16 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         var encoding = Encoding.GetEncoding(932);
         var sourceLines = File.ReadAllLines(sourceScriptPath, encoding);
-        var runtimeLines = InstrumentWindowsLoopMarkers(sourceLines);
+        var telemetry = InstrumentWindowsRuntimeTelemetry(sourceLines);
+        _estimatedCommandsPerLoop = telemetry.CommandsPerLoop;
+        _estimatedFixedCommandCount = telemetry.FixedCommandCount;
+        _commandDescriptionByIndex.Clear();
+        foreach (var pair in telemetry.CommandDescriptionByIndex)
+        {
+            _commandDescriptionByIndex[pair.Key] = pair.Value;
+        }
+
+        var runtimeLines = telemetry.Lines;
         var runtimeScriptPath = Path.Combine(
             RuntimeDirectoryPath,
             $"{Path.GetFileNameWithoutExtension(sourceScriptPath)}.gui.generated.bat");
@@ -1677,35 +1766,72 @@ public partial class MainWindowViewModel : ViewModelBase
         return runtimeScriptPath;
     }
 
-    private static List<string> InstrumentWindowsLoopMarkers(IReadOnlyList<string> sourceLines)
+    private static WindowsRuntimeTelemetry InstrumentWindowsRuntimeTelemetry(IReadOnlyList<string> sourceLines)
     {
         if (sourceLines.Count == 0)
         {
-            return [];
+            return new WindowsRuntimeTelemetry([], 0, 0, new Dictionary<int, string>());
         }
 
-        if (sourceLines.Any(line => line.IndexOf("[GUI-LOOP-START]", StringComparison.OrdinalIgnoreCase) >= 0))
-        {
-            return sourceLines.ToList();
-        }
-
-        var result = new List<string>(sourceLines.Count + 8);
-        var injectedAtLoop = false;
+        var hasLoopMarkers = sourceLines.Any(line => line.IndexOf("[GUI-LOOP-START]", StringComparison.OrdinalIgnoreCase) >= 0);
+        var hasCommandMarkers = sourceLines.Any(line => line.IndexOf("[GUI-CMD-START]", StringComparison.OrdinalIgnoreCase) >= 0);
+        var result = new List<string>(sourceLines.Count + 256);
+        var commandDescriptionByIndex = new Dictionary<int, string>();
+        var injectedAtLoop = hasLoopMarkers;
+        var loopIndexInitialized = hasLoopMarkers;
+        var insideOuterLoop = false;
+        var commandIndex = 0;
+        var commandsPerLoop = 0;
+        var fixedCommandCount = 0;
 
         foreach (var line in sourceLines)
         {
+            if (!insideOuterLoop && IsOuterLoopHeaderLine(line))
+            {
+                insideOuterLoop = true;
+            }
+
             if (!injectedAtLoop && IsOuterLoopHeaderLine(line))
             {
                 var indent = GetLeadingWhitespace(line) + "      ";
                 result.Add("SET GUI_LOOP_INDEX=0");
+                loopIndexInitialized = true;
                 result.Add(line);
                 result.Add($"{indent}SET /A GUI_LOOP_INDEX=!GUI_LOOP_INDEX!+1");
                 result.Add($"{indent}ECHO [GUI-LOOP-START] !GUI_LOOP_INDEX!");
                 injectedAtLoop = true;
+                insideOuterLoop = true;
                 continue;
             }
 
-            if (injectedAtLoop && IsOuterLoopIncrementLine(line))
+            if (!hasCommandMarkers && IsTelemetryTargetCommandLine(line))
+            {
+                var indent = GetLeadingWhitespace(line);
+                if (!loopIndexInitialized)
+                {
+                    result.Add($"{indent}SET GUI_LOOP_INDEX=0");
+                    loopIndexInitialized = true;
+                }
+
+                commandIndex += 1;
+                commandDescriptionByIndex[commandIndex] = BuildTelemetryCommandDescription(line);
+
+                if (insideOuterLoop)
+                {
+                    commandsPerLoop += 1;
+                }
+                else
+                {
+                    fixedCommandCount += 1;
+                }
+
+                result.Add($"{indent}ECHO [GUI-CMD-START] L!GUI_LOOP_INDEX!#{commandIndex}");
+                result.Add(line);
+                result.Add($"{indent}ECHO [GUI-CMD-END] L!GUI_LOOP_INDEX!#{commandIndex} RC=!ERRORLEVEL!");
+                continue;
+            }
+
+            if (!hasLoopMarkers && injectedAtLoop && IsOuterLoopIncrementLine(line))
             {
                 var indent = GetLeadingWhitespace(line);
                 result.Add($"{indent}ECHO [GUI-LOOP-DONE] !GUI_LOOP_INDEX!");
@@ -1714,7 +1840,7 @@ public partial class MainWindowViewModel : ViewModelBase
             result.Add(line);
         }
 
-        return result;
+        return new WindowsRuntimeTelemetry(result, commandsPerLoop, fixedCommandCount, commandDescriptionByIndex);
     }
 
     private static bool IsOuterLoopHeaderLine(string line)
@@ -1751,6 +1877,39 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         return index == 0 ? string.Empty : line[..index];
+    }
+
+    private static bool IsTelemetryTargetCommandLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        var trimmed = line.TrimStart();
+        if (!trimmed.StartsWith("qacli ", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (trimmed.StartsWith("REM ", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("::", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static string BuildTelemetryCommandDescription(string line)
+    {
+        var trimmed = line.Trim();
+        if (trimmed.Length <= 220)
+        {
+            return trimmed;
+        }
+
+        return trimmed[..220] + "...";
     }
 
     private Process BuildProcess(LaunchCommand launch)
@@ -1803,12 +1962,18 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             var normalizedLine = line.Trim();
             _observedOutputLineCount += 1;
-            _lastOutputLine = normalizedLine;
             _lastOutputUtc = DateTime.UtcNow;
-            AppendLog(line, isError, false);
             LastOutputTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             LastOutputAgeSeconds = 0;
             OutputActivity = GetOutputActivityText(isActive: true);
+
+            if (TryHandleRuntimeTelemetryLine(normalizedLine))
+            {
+                return;
+            }
+
+            _lastOutputLine = normalizedLine;
+            AppendLog(line, isError, false);
             UpdateRealtimeProgressFromOutput(normalizedLine);
 
             var failureDetected = IsFailureOutputLine(normalizedLine);
@@ -1837,6 +2002,196 @@ public partial class MainWindowViewModel : ViewModelBase
 
             _ = AppendRunLogLineAsync(line);
         });
+    }
+
+    private bool TryHandleRuntimeTelemetryLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        if (GuiLoopMarkerRegex.IsMatch(line))
+        {
+            TryApplyGuiLoopMarker(line);
+            UpdateProgressTextDisplay();
+            UpdateEstimatedTimeDisplay(DateTime.UtcNow - _runStartedUtc);
+            return true;
+        }
+
+        var startMatch = GuiCommandStartMarkerRegex.Match(line);
+        if (startMatch.Success)
+        {
+            var loopText = startMatch.Groups["loop"].Value;
+            var loopIndex = int.TryParse(loopText, out var parsedLoop) ? parsedLoop : 0;
+            if (int.TryParse(startMatch.Groups["cmd"].Value, out var commandIndex))
+            {
+                var key = BuildCommandTelemetryKey(loopIndex, commandIndex);
+                _activeCommandStartUtcByKey[key] = DateTime.UtcNow;
+            }
+
+            return true;
+        }
+
+        var endMatch = GuiCommandEndMarkerRegex.Match(line);
+        if (endMatch.Success)
+        {
+            var loopText = endMatch.Groups["loop"].Value;
+            var loopIndex = int.TryParse(loopText, out var parsedLoop) ? parsedLoop : 0;
+            if (!int.TryParse(endMatch.Groups["cmd"].Value, out var commandIndex))
+            {
+                return true;
+            }
+
+            _ = int.TryParse(endMatch.Groups["rc"].Value, out var returnCode);
+            var elapsedText = "-";
+            var key = BuildCommandTelemetryKey(loopIndex, commandIndex);
+            if (_activeCommandStartUtcByKey.TryGetValue(key, out var startedUtc))
+            {
+                _activeCommandStartUtcByKey.Remove(key);
+                var duration = DateTime.UtcNow - startedUtc;
+                if (duration.TotalMilliseconds >= 0)
+                {
+                    PushRecentDuration(_recentCommandDurationSeconds, duration.TotalSeconds, 400);
+                    elapsedText = FormatDurationWithMilliseconds(duration);
+                }
+            }
+
+            _completedCommandCount += 1;
+            UpdateRealtimeProgressFromOutput(line);
+
+            var description = _commandDescriptionByIndex.TryGetValue(commandIndex, out var mapped)
+                ? mapped
+                : $"qacli command #{commandIndex}";
+            _ = AppendRunLogLineAsync($"[CMD-TIME] loop={loopIndex} cmd={commandIndex} elapsed={elapsedText} rc={returnCode} command={description}");
+            return true;
+        }
+
+        return false;
+    }
+
+    private static string BuildCommandTelemetryKey(int loopIndex, int commandIndex)
+    {
+        return $"{loopIndex}:{commandIndex}";
+    }
+
+    private static void PushRecentDuration(Queue<double> queue, double seconds, int maxItems)
+    {
+        if (double.IsNaN(seconds) || double.IsInfinity(seconds) || seconds < 0)
+        {
+            return;
+        }
+
+        queue.Enqueue(seconds);
+        while (queue.Count > maxItems)
+        {
+            _ = queue.Dequeue();
+        }
+    }
+
+    private static string FormatDurationWithMilliseconds(TimeSpan duration)
+    {
+        if (duration < TimeSpan.Zero)
+        {
+            duration = TimeSpan.Zero;
+        }
+
+        return duration.ToString(@"hh\:mm\:ss\.fff");
+    }
+
+    private async Task AppendRunTelemetrySummaryAsync()
+    {
+        if (!_hasActiveRunLog || string.IsNullOrWhiteSpace(CurrentRunLogPath))
+        {
+            return;
+        }
+
+        var avgCommandSeconds = CalculateRobustAverageSeconds(_recentCommandDurationSeconds);
+        var avgLoopSeconds = CalculateRobustAverageSeconds(_recentLoopDurationSeconds);
+        await AppendRunLogLineAsync(
+            $"[RUN-STATS] completed_commands={_completedCommandCount} estimated_total_commands={_estimatedTotalCommandCount} avg_command_sec={avgCommandSeconds:0.000} avg_loop_sec={avgLoopSeconds:0.000} auto_enter_count={AutoEnterCount} prompt_delay_ms={PromptDelayMilliseconds}");
+    }
+
+    private void LoadHistoricalTimingProfile()
+    {
+        _historicalAverageSecondsByCommandIndex.Clear();
+        _historicalCommandSampleCount = 0;
+
+        if (string.IsNullOrWhiteSpace(OutputLogDirectoryPath) || !Directory.Exists(OutputLogDirectoryPath))
+        {
+            return;
+        }
+
+        var files = Directory
+            .EnumerateFiles(OutputLogDirectoryPath, "gui_run_*.log", SearchOption.TopDirectoryOnly)
+            .OrderByDescending(path => File.GetLastWriteTimeUtc(path))
+            .Take(8)
+            .ToList();
+        if (files.Count == 0)
+        {
+            return;
+        }
+
+        var samplesByCommand = new Dictionary<int, List<double>>();
+        foreach (var file in files)
+        {
+            IEnumerable<string> lines;
+            try
+            {
+                lines = File.ReadLines(file, new UTF8Encoding(false));
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var line in lines)
+            {
+                var match = CommandTimingLogRegex.Match(line);
+                if (!match.Success)
+                {
+                    continue;
+                }
+
+                if (!int.TryParse(match.Groups["cmd"].Value, out var commandIndex) || commandIndex <= 0)
+                {
+                    continue;
+                }
+
+                if (!TimeSpan.TryParseExact(
+                        match.Groups["elapsed"].Value,
+                        @"hh\:mm\:ss\.fff",
+                        CultureInfo.InvariantCulture,
+                        out var elapsed))
+                {
+                    continue;
+                }
+
+                var seconds = elapsed.TotalSeconds;
+                if (double.IsNaN(seconds) || double.IsInfinity(seconds) || seconds < 0)
+                {
+                    continue;
+                }
+
+                _historicalCommandSampleCount += 1;
+                if (!samplesByCommand.TryGetValue(commandIndex, out var samples))
+                {
+                    samples = new List<double>(16);
+                    samplesByCommand[commandIndex] = samples;
+                }
+
+                samples.Add(seconds);
+            }
+        }
+
+        foreach (var pair in samplesByCommand)
+        {
+            var average = CalculateRobustAverageSeconds(pair.Value);
+            if (average > 0)
+            {
+                _historicalAverageSecondsByCommandIndex[pair.Key] = average;
+            }
+        }
     }
 
     private void MarkFailureDetected(string line)
@@ -1879,8 +2234,9 @@ public partial class MainWindowViewModel : ViewModelBase
         AppendLog("[GUI] Stop requested automatically due to first error.", true, true);
         await AppendRunLogLineAsync("[GUI] Stop requested automatically due to first error.");
 
-        if (!_runningProcess.HasExited)
+        if (!TryGetProcessHasExited(_runningProcess, out var hasExited) || !hasExited)
         {
+            CancelProcessExitWait();
             await KillProcessTreeAsync(_runningProcess.Id);
         }
     }
@@ -1955,6 +2311,76 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
+    private async Task<bool> WaitForManagedProcessExitAsync(Process process)
+    {
+        _processExitWaitCts?.Dispose();
+        _processExitWaitCts = new CancellationTokenSource();
+        try
+        {
+            await process.WaitForExitAsync(_processExitWaitCts.Token);
+            return true;
+        }
+        catch (OperationCanceledException) when (_stopRequested || _stopRequestedByUser)
+        {
+            try
+            {
+                return process.WaitForExit(3000);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
+    private void CancelProcessExitWait()
+    {
+        try
+        {
+            _processExitWaitCts?.Cancel();
+        }
+        catch
+        {
+            // Ignore best-effort cancellation failures.
+        }
+    }
+
+    private static bool TryGetProcessHasExited(Process? process, out bool hasExited)
+    {
+        hasExited = true;
+        if (process is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            hasExited = process.HasExited;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static int TryGetProcessExitCode(Process? process, int fallback)
+    {
+        if (process is null)
+        {
+            return fallback;
+        }
+
+        try
+        {
+            return process.ExitCode;
+        }
+        catch
+        {
+            return fallback;
+        }
+    }
+
     private async Task RunAutoConfirmLoopAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -2015,6 +2441,13 @@ public partial class MainWindowViewModel : ViewModelBase
                 LastOutputAgeSeconds = outputAgeSeconds;
                 OutputActivity = outputState;
                 UpdateEstimatedTimeDisplay(elapsed);
+
+                if ((nowUtc - _lastEtaSnapshotUtc).TotalSeconds >= 30)
+                {
+                    _lastEtaSnapshotUtc = nowUtc;
+                    _ = AppendRunLogLineAsync(
+                        $"[ETA-SNAPSHOT] elapsed={ElapsedTime} progress={ProgressPercentage:0.0}% remaining={EstimatedRemaining} finish={EstimatedFinishTime} cmd={_completedCommandCount}/{_estimatedTotalCommandCount} loop={LoopCompletedCount}/{ConfiguredLoopCount} auto_enter={AutoEnterCount} prompt_delay_ms={PromptDelayMilliseconds} eta_delay_bias_sec={_lastEtaPromptDelayBiasSeconds:0.0}");
+                }
             });
         }
     }
@@ -2127,7 +2560,7 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        if (LoopStartedCount == 0)
+        if (LoopStartedCount == 0 && _observedOutputLineCount > 0)
         {
             LoopStartedCount = 1;
         }
@@ -2141,7 +2574,18 @@ public partial class MainWindowViewModel : ViewModelBase
             TotalFailureInSummaries += failureCount;
         }
 
-        var pulseProgress = Math.Min(95.0, 95.0 * (1.0 - Math.Exp(-_observedOutputLineCount / 280.0)));
+        var commandProgress = 0.0;
+        if (_estimatedTotalCommandCount > 0 && _completedCommandCount > 0)
+        {
+            commandProgress = Math.Min(99.5, (_completedCommandCount * 100.0) / _estimatedTotalCommandCount);
+        }
+
+        var pulseProgress = 0.0;
+        if (commandProgress <= 0.01)
+        {
+            pulseProgress = Math.Min(92.0, 92.0 * (1.0 - Math.Exp(-_observedOutputLineCount / 320.0)));
+        }
+
         var summaryProgress = 0.0;
         if (ProcessedSummaryCount > 0)
         {
@@ -2150,7 +2594,7 @@ public partial class MainWindowViewModel : ViewModelBase
             summaryProgress = Math.Min(95.0, (ProcessedSummaryCount * 100.0) / estimatedTotalSummaries);
         }
 
-        var nextProgress = Math.Max(ProgressPercentage, Math.Max(pulseProgress, summaryProgress));
+        var nextProgress = Math.Max(ProgressPercentage, Math.Max(commandProgress, Math.Max(pulseProgress, summaryProgress)));
         if (nextProgress > ProgressPercentage)
         {
             ProgressPercentage = nextProgress;
@@ -2169,11 +2613,26 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         var completed = Math.Min(LoopCompletedCount, ConfiguredLoopCount);
+        if (_estimatedTotalCommandCount > 0)
+        {
+            var doneCommands = Math.Min(_completedCommandCount, _estimatedTotalCommandCount);
+            ProgressText = $"{completed} / {ConfiguredLoopCount} ({ProgressPercentage:0.0}%)  cmd {doneCommands}/{_estimatedTotalCommandCount}";
+            return;
+        }
+
         ProgressText = $"{completed} / {ConfiguredLoopCount} ({ProgressPercentage:0.0}%)";
     }
 
     private void UpdateEstimatedTimeDisplay(TimeSpan elapsed)
     {
+        _lastEtaPromptDelayBiasSeconds = 0;
+        if (TryEstimateRemainingFromTelemetry(out var telemetryRemaining))
+        {
+            EstimatedRemaining = FormatDurationForDisplay(telemetryRemaining);
+            EstimatedFinishTime = DateTime.Now.Add(telemetryRemaining).ToString("yyyy-MM-dd HH:mm:ss");
+            return;
+        }
+
         var progress = Math.Clamp(ProgressPercentage, 0.0, 100.0);
         if (progress <= 0.01)
         {
@@ -2204,6 +2663,223 @@ public partial class MainWindowViewModel : ViewModelBase
         EstimatedFinishTime = DateTime.Now.Add(remaining).ToString("yyyy-MM-dd HH:mm:ss");
     }
 
+    private bool TryEstimateRemainingFromTelemetry(out TimeSpan remaining)
+    {
+        remaining = TimeSpan.Zero;
+        if (TryEstimateRemainingFromCommandProfile(out remaining))
+        {
+            return true;
+        }
+
+        if (ConfiguredLoopCount > 1 && LoopCompletedCount > 0 && _recentLoopDurationSeconds.Count > 0)
+        {
+            var averageLoopSeconds = CalculateRobustAverageSeconds(_recentLoopDurationSeconds);
+            if (averageLoopSeconds > 0)
+            {
+                var remainingLoops = Math.Max(0, ConfiguredLoopCount - LoopCompletedCount);
+                var estimatedSeconds = averageLoopSeconds * remainingLoops;
+                if (!double.IsNaN(estimatedSeconds)
+                    && !double.IsInfinity(estimatedSeconds)
+                    && estimatedSeconds <= TimeSpan.FromDays(30).TotalSeconds)
+                {
+                    remaining = TimeSpan.FromSeconds(Math.Max(0, estimatedSeconds));
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private bool TryEstimateRemainingFromCommandProfile(out TimeSpan remaining)
+    {
+        remaining = TimeSpan.Zero;
+        if (_estimatedTotalCommandCount <= 0)
+        {
+            return false;
+        }
+
+        var remainingCommands = Math.Max(0, _estimatedTotalCommandCount - _completedCommandCount);
+        if (remainingCommands == 0)
+        {
+            return false;
+        }
+
+        var recentAverage = CalculateRobustAverageSeconds(_recentCommandDurationSeconds);
+        var historicalAverage = CalculateRobustAverageSeconds(_historicalAverageSecondsByCommandIndex.Values);
+        var fallbackAverage = recentAverage > 0 && historicalAverage > 0
+            ? ((recentAverage * 0.6) + (historicalAverage * 0.4))
+            : Math.Max(recentAverage, historicalAverage);
+        if (fallbackAverage <= 0)
+        {
+            return false;
+        }
+
+        double predictedCompletedSeconds = 0;
+        double predictedRemainingSeconds = 0;
+        for (var sequence = 1; sequence <= _estimatedTotalCommandCount; sequence++)
+        {
+            var commandIndex = ResolveCommandIndexFromSequence(sequence);
+            var averageForCommand = _historicalAverageSecondsByCommandIndex.TryGetValue(commandIndex, out var profiled)
+                ? profiled
+                : fallbackAverage;
+            averageForCommand = Math.Max(0, averageForCommand);
+            if (sequence <= _completedCommandCount)
+            {
+                predictedCompletedSeconds += averageForCommand;
+            }
+            else
+            {
+                predictedRemainingSeconds += averageForCommand;
+            }
+        }
+
+        if (predictedRemainingSeconds <= 0)
+        {
+            return false;
+        }
+
+        var runtimeScale = 1.0;
+        if (_completedCommandCount >= 12 && predictedCompletedSeconds > 1.0)
+        {
+            var elapsedSeconds = Math.Max(1.0, (DateTime.UtcNow - _runStartedUtc).TotalSeconds);
+            var rawScale = elapsedSeconds / predictedCompletedSeconds;
+            if (!double.IsNaN(rawScale) && !double.IsInfinity(rawScale) && rawScale > 0)
+            {
+                rawScale = Math.Clamp(rawScale, 0.40, 3.00);
+                var confidence = Math.Min(1.0, _completedCommandCount / 90.0);
+                runtimeScale = ((1.0 - confidence) * 1.0) + (confidence * rawScale);
+            }
+        }
+
+        if (recentAverage > 0 && historicalAverage > 0)
+        {
+            var localScale = Math.Clamp(recentAverage / historicalAverage, 0.50, 2.00);
+            var localConfidence = Math.Min(1.0, _recentCommandDurationSeconds.Count / 40.0) * 0.35;
+            runtimeScale = ((1.0 - localConfidence) * runtimeScale) + (localConfidence * localScale);
+        }
+
+        var totalSeconds = predictedRemainingSeconds * runtimeScale;
+        var promptDelayAdjustment = EstimatePromptDelayAdjustmentSeconds(remainingCommands);
+        if (promptDelayAdjustment > 0)
+        {
+            totalSeconds += promptDelayAdjustment;
+        }
+
+        if (double.IsNaN(totalSeconds)
+            || double.IsInfinity(totalSeconds)
+            || totalSeconds <= 0
+            || totalSeconds > TimeSpan.FromDays(30).TotalSeconds)
+        {
+            return false;
+        }
+
+        _lastEtaPromptDelayBiasSeconds = promptDelayAdjustment;
+        remaining = TimeSpan.FromSeconds(totalSeconds);
+        return true;
+    }
+
+    private double EstimatePromptDelayAdjustmentSeconds(int remainingCommands)
+    {
+        if (!AutoConfirmPrompts
+            || PromptDelayMilliseconds <= 0
+            || remainingCommands <= 0
+            || _completedCommandCount <= 0
+            || AutoEnterCount <= 0)
+        {
+            return 0;
+        }
+
+        var autoEnterPerCommand = (double)AutoEnterCount / _completedCommandCount;
+        if (double.IsNaN(autoEnterPerCommand) || double.IsInfinity(autoEnterPerCommand) || autoEnterPerCommand <= 0)
+        {
+            return 0;
+        }
+
+        // Limit runaway values from transient bursts in early output.
+        autoEnterPerCommand = Math.Clamp(autoEnterPerCommand, 0.0, 12.0);
+        var delayPerEnterSeconds = PromptDelayMilliseconds / 1000.0;
+        var pendingDelaySeconds = remainingCommands * autoEnterPerCommand * delayPerEnterSeconds;
+        if (double.IsNaN(pendingDelaySeconds) || double.IsInfinity(pendingDelaySeconds) || pendingDelaySeconds <= 0)
+        {
+            return 0;
+        }
+
+        // Fade this correction as command-duration telemetry accumulates.
+        var confidence = Math.Min(1.0, _completedCommandCount / 90.0);
+        var weight = 1.0 - confidence;
+        var adjustment = pendingDelaySeconds * weight;
+        if (double.IsNaN(adjustment) || double.IsInfinity(adjustment) || adjustment <= 0)
+        {
+            return 0;
+        }
+
+        return adjustment;
+    }
+
+    private int ResolveCommandIndexFromSequence(int sequence)
+    {
+        if (sequence <= 0)
+        {
+            return 1;
+        }
+
+        if (sequence <= _estimatedFixedCommandCount)
+        {
+            return sequence;
+        }
+
+        if (_estimatedCommandsPerLoop <= 0)
+        {
+            return Math.Max(1, _estimatedFixedCommandCount);
+        }
+
+        var offset = sequence - _estimatedFixedCommandCount - 1;
+        var withinLoop = offset % _estimatedCommandsPerLoop;
+        return _estimatedFixedCommandCount + withinLoop + 1;
+    }
+
+    private static double CalculateRobustAverageSeconds(Queue<double> values)
+    {
+        return CalculateRobustAverageSeconds(values.AsEnumerable());
+    }
+
+    private static double CalculateRobustAverageSeconds(IEnumerable<double> values)
+    {
+        var materialized = values?.ToArray() ?? [];
+        if (materialized.Length == 0)
+        {
+            return 0;
+        }
+
+        var sorted = materialized
+            .Where(v => !double.IsNaN(v) && !double.IsInfinity(v) && v >= 0)
+            .OrderBy(v => v)
+            .ToArray();
+        if (sorted.Length == 0)
+        {
+            return 0;
+        }
+
+        var trim = sorted.Length >= 12 ? Math.Max(1, sorted.Length / 10) : 0;
+        var start = trim;
+        var end = sorted.Length - trim;
+        if (end <= start)
+        {
+            start = 0;
+            end = sorted.Length;
+        }
+
+        var span = sorted.AsSpan(start, end - start);
+        double sum = 0;
+        for (var i = 0; i < span.Length; i++)
+        {
+            sum += span[i];
+        }
+
+        return span.Length == 0 ? 0 : sum / span.Length;
+    }
+
     private static string FormatDurationForDisplay(TimeSpan duration)
     {
         if (duration < TimeSpan.Zero)
@@ -2213,6 +2889,12 @@ public partial class MainWindowViewModel : ViewModelBase
 
         var totalHours = (int)Math.Floor(duration.TotalHours);
         return $"{totalHours:00}:{duration.Minutes:00}:{duration.Seconds:00}";
+    }
+
+    private void SetCompletionEtaNow()
+    {
+        EstimatedRemaining = "00:00:00";
+        EstimatedFinishTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
     }
 
     private void TryApplyGuiLoopMarker(string line)
@@ -2226,6 +2908,7 @@ public partial class MainWindowViewModel : ViewModelBase
         var markerType = match.Groups["type"].Value.ToUpperInvariant();
         var hasIndex = int.TryParse(match.Groups["index"].Value, out var parsedIndex) && parsedIndex > 0;
         var markerIndex = hasIndex ? parsedIndex : 0;
+        var nowUtc = DateTime.UtcNow;
 
         switch (markerType)
         {
@@ -2233,6 +2916,7 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 var started = hasIndex ? markerIndex : LoopStartedCount + 1;
                 LoopStartedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopStartedCount, started));
+                _loopStartedUtcByIndex[LoopStartedCount] = nowUtc;
                 break;
             }
             case "DONE":
@@ -2240,6 +2924,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 var completed = hasIndex ? markerIndex : LoopCompletedCount + 1;
                 LoopCompletedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopCompletedCount, completed));
                 LoopStartedCount = Math.Max(LoopStartedCount, LoopCompletedCount);
+                RecordLoopDurationIfAvailable(completed, nowUtc, "DONE");
                 break;
             }
             case "FAIL":
@@ -2247,6 +2932,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 var failed = hasIndex ? markerIndex : LoopFailedCount + 1;
                 LoopFailedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopFailedCount, failed));
                 LoopStartedCount = Math.Max(LoopStartedCount, LoopFailedCount);
+                RecordLoopDurationIfAvailable(failed, nowUtc, "FAIL");
                 break;
             }
         }
@@ -2256,6 +2942,29 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             ProgressPercentage = markerProgress;
         }
+    }
+
+    private void RecordLoopDurationIfAvailable(int loopIndex, DateTime finishedUtc, string status)
+    {
+        if (loopIndex <= 0)
+        {
+            return;
+        }
+
+        if (!_loopStartedUtcByIndex.TryGetValue(loopIndex, out var startedUtc))
+        {
+            return;
+        }
+
+        _loopStartedUtcByIndex.Remove(loopIndex);
+        var duration = finishedUtc - startedUtc;
+        if (duration.TotalMilliseconds < 0)
+        {
+            return;
+        }
+
+        PushRecentDuration(_recentLoopDurationSeconds, duration.TotalSeconds, 64);
+        _ = AppendRunLogLineAsync($"[LOOP-TIME] loop={loopIndex} status={status} elapsed={FormatDurationWithMilliseconds(duration)}");
     }
 
     private static bool TryParseSummaryCounts(string line, out int successCount, out int failureCount)
@@ -2788,7 +3497,10 @@ public partial class MainWindowViewModel : ViewModelBase
             return false;
         }
 
-        return text.TrimStart().StartsWith("[GUI]", StringComparison.OrdinalIgnoreCase);
+        var trimmed = text.TrimStart();
+        return trimmed.StartsWith("[GUI]", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("[GUI-", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("[GUI-", StringComparison.OrdinalIgnoreCase);
     }
 
     private void ResetExtractedErrors()
@@ -3023,6 +3735,12 @@ public partial class MainWindowViewModel : ViewModelBase
         Encoding StandardOutputEncoding,
         Encoding StandardErrorEncoding,
         string DisplayCommand);
+
+    private sealed record WindowsRuntimeTelemetry(
+        List<string> Lines,
+        int CommandsPerLoop,
+        int FixedCommandCount,
+        Dictionary<int, string> CommandDescriptionByIndex);
 
     private sealed record PrecheckProcessResult(
         int ExitCode,
