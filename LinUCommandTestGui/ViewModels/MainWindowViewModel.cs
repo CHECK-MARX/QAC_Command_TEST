@@ -1576,9 +1576,10 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 return string.Empty;
             }
-
-            var parts = text
-                .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+var parts = text
+    .Split(
+        new char[] { '\r', '\n' },
+        StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             return parts.FirstOrDefault() ?? string.Empty;
         }
 
@@ -1927,7 +1928,23 @@ public partial class MainWindowViewModel : ViewModelBase
             StandardOutputEncoding = launch.StandardOutputEncoding,
             StandardErrorEncoding = launch.StandardErrorEncoding
         };
+ if (OperatingSystem.IsLinux())
+    {
+        var editorWrapper = Path.Combine(
+            AppContext.BaseDirectory,
+            "Tools",
+            "qacli-editor-terminal.sh");
 
+        if (!File.Exists(editorWrapper))
+        {
+            throw new FileNotFoundException(
+                "qacli-editor-terminal.sh が見つかりません。",
+                editorWrapper);
+        }
+
+        startInfo.Environment["EDITOR"] = editorWrapper;
+        startInfo.Environment["VISUAL"] = editorWrapper;
+    }
         SetEnvironmentIfNotEmpty(startInfo, "QAF_ROOT", QafRoot);
         SetEnvironmentIfNotEmpty(startInfo, "QACLI_BIN", QacliBinPath);
         SetEnvironmentIfNotEmpty(startInfo, "TEST_ROOT", TestRoot);
