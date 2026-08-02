@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
@@ -15,6 +16,7 @@ using System.Threading.Tasks;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using LinUCommandTestGui;
 
 namespace LinUCommandTestGui.ViewModels;
 
@@ -215,7 +217,6 @@ public partial class MainWindowViewModel : ViewModelBase
     private string _lastOutputLine = string.Empty;
     private string _lastErrorHintLine = string.Empty;
     private DateTime _lastOutputUtc = DateTime.UtcNow;
-    private DateTime _lastAutoConfirmSentUtc = DateTime.MinValue;
     private int _observedOutputLineCount;
     private int _estimatedCommandsPerLoop;
     private int _estimatedFixedCommandCount;
@@ -232,12 +233,16 @@ public partial class MainWindowViewModel : ViewModelBase
     private DateTime _lastEtaSnapshotUtc = DateTime.MinValue;
     private double _lastEtaPromptDelayBiasSeconds;
     private CancellationTokenSource? _processExitWaitCts;
-    private CancellationTokenSource? _autoConfirmLoopCts;
-    private Task? _autoConfirmLoopTask;
     private CancellationTokenSource? _runtimeStatusLoopCts;
     private Task? _runtimeStatusLoopTask;
     private readonly Dictionary<string, ParsedErrorItemViewModel> _errorFindingIndex = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _logWriteSemaphore = new(1, 1);
+    private readonly SemaphoreSlim _autoConfirmSemaphore = new(1, 1);
+    private readonly ConcurrentQueue<(string Line, bool IsError, DateTime ReceivedUtc)> _pendingProcessOutputLines = new();
+    private readonly DispatcherTimer _processOutputFlushTimer;
+    private const int MaxProcessOutputLinesPerFlush = 500;
+    private const int MaxLiveOutputCharacters = 120_000;
+    private static readonly UTF8Encoding Utf8WithoutBom = new(false);
     private static readonly HttpClient Http = new()
     {
         Timeout = TimeSpan.FromSeconds(5)
@@ -285,6 +290,11 @@ public partial class MainWindowViewModel : ViewModelBase
     public MainWindowViewModel()
     {
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        _processOutputFlushTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(200)
+        };
+        _processOutputFlushTimer.Tick += (_, _) => FlushPendingProcessOutputLines();
         T.SetLanguage("ja");
         SelectedLanguage = LanguageOptions.FirstOrDefault();
         StatusText = LocalizeText("\u5F85\u6A5F", "Idle");
@@ -319,6 +329,7 @@ public partial class MainWindowViewModel : ViewModelBase
         OnPropertyChanged(nameof(ErrorLastSeenLabel));
         OnPropertyChanged(nameof(ErrorExplanationLabel));
         OnPropertyChanged(nameof(ErrorHintLabel));
+        OnPropertyChanged(nameof(HeaderTitleWithBuild));
     }
 
     private bool IsJapaneseUiLanguage()
@@ -353,6 +364,8 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     public string PrecheckButtonText => LocalizeText("\u4E8B\u524D\u78BA\u8A8D", "Precheck");
+
+    public string HeaderTitleWithBuild => $"{T["HeaderTitle"]}  {PlatformRuntime.BuildIdentity}";
 
     public string ErrorAnalysisTabTitle => LocalizeText("\u30A8\u30E9\u30FC\u89E3\u6790", "Error Analysis");
 
@@ -609,7 +622,6 @@ public partial class MainWindowViewModel : ViewModelBase
             _lastOutputLine = string.Empty;
             _lastErrorHintLine = string.Empty;
             _lastOutputUtc = DateTime.UtcNow;
-            _lastAutoConfirmSentUtc = DateTime.MinValue;
             _observedOutputLineCount = 0;
             _runStartedUtc = DateTime.UtcNow;
             _completedCommandCount = 0;
@@ -659,8 +671,6 @@ public partial class MainWindowViewModel : ViewModelBase
 
             var process = BuildProcess(launch);
             _runningProcess = process;
-            process.OutputDataReceived += (_, e) => HandleProcessOutputLine(e.Data, false);
-            process.ErrorDataReceived += (_, e) => HandleProcessOutputLine(e.Data, true);
 
             if (!process.Start())
             {
@@ -672,22 +682,22 @@ public partial class MainWindowViewModel : ViewModelBase
             AppendLog($"[GUI] Process started: {launch.DisplayCommand}", false, true);
             await AppendRunLogLineAsync($"[GUI] Process started: {launch.DisplayCommand}");
 
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-            StartAutoConfirmLoop();
+            StartProcessOutputPump();
+            var standardOutputPump = PumpProcessStreamAsync(process.StandardOutput, isError: false);
+            var standardErrorPump = PumpProcessStreamAsync(process.StandardError, isError: true);
             StartRuntimeStatusLoop();
             var processExited = await WaitForManagedProcessExitAsync(process);
 
             try
             {
-                process.CancelOutputRead();
-                process.CancelErrorRead();
+                await Task.WhenAll(standardOutputPump, standardErrorPump);
             }
             catch
             {
-                // Ignore cancellation exceptions after process exit.
+                // The process-exit result below remains authoritative if a stream closes abruptly.
             }
 
+            StopProcessOutputPump();
             var hasExited = processExited || TryGetProcessHasExited(process, out var exitedState) && exitedState;
             var exitCode = hasExited ? TryGetProcessExitCode(process, fallback: -1) : -1;
             ElapsedTime = (DateTime.UtcNow - _runStartedUtc).ToString(@"hh\:mm\:ss");
@@ -744,18 +754,13 @@ public partial class MainWindowViewModel : ViewModelBase
                     ProcessedSummaryCount = ConfiguredLoopCount;
                 }
 
-                LoopStartedCount = Math.Max(LoopStartedCount, ConfiguredLoopCount);
-                LoopCompletedCount = Math.Max(LoopCompletedCount, ConfiguredLoopCount);
-
                 if (TotalSuccessInSummaries == 0 && TotalFailureInSummaries == 0)
                 {
                     TotalSuccessInSummaries = ConfiguredLoopCount;
                 }
 
                 TotalFailureInSummaries = 0;
-                ProgressPercentage = 100;
-                UpdateProgressTextDisplay();
-                UpdateEstimatedTimeDisplay(DateTime.UtcNow - _runStartedUtc);
+                CompleteFinishedScriptProgress();
                 RunResult = "PASS";
                 VerdictText = "PASS";
                 VerdictReason = LocalizeText("\u51E6\u7406\u304C\u6B63\u5E38\u7D42\u4E86\u3057\u307E\u3057\u305F\u3002 (exit code 0)", "Process exited with code 0.");
@@ -766,6 +771,13 @@ public partial class MainWindowViewModel : ViewModelBase
             }
             else
             {
+                if (exitCode == 0)
+                {
+                    // The script ran to completion, even though its output contains a test failure.
+                    // Show terminal progress separately from the PASS/FAIL verdict.
+                    CompleteFinishedScriptProgress();
+                }
+
                 LoopFailedCount = Math.Max(LoopFailedCount, 1);
                 TotalFailureInSummaries = Math.Max(TotalFailureInSummaries, 1);
                 NormalizeSingleLoopCountersAfterExit();
@@ -793,9 +805,9 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         finally
         {
+            StopProcessOutputPump();
             await AppendRunTelemetrySummaryAsync();
             await StopRuntimeStatusLoopAsync();
-            await StopAutoConfirmLoopAsync();
             CancelProcessExitWait();
             _processExitWaitCts?.Dispose();
             _processExitWaitCts = null;
@@ -1474,11 +1486,30 @@ public partial class MainWindowViewModel : ViewModelBase
             ? LinURootPath
             : Directory.GetCurrentDirectory();
 
-        var arguments = $"auth --validate --username {QuoteArgument(ValUser)} --password {QuoteArgument(ValPass)} --url {QuoteArgument(ValServer)}";
-        var result = await RunProcessForPrecheckAsync(qacliPath, arguments, workingDirectory, TimeSpan.FromSeconds(20));
+        string[] arguments =
+        [
+            "auth",
+            "--validate",
+            "--username",
+            ValUser,
+            "--password",
+            ValPass,
+            "--url",
+            ValServer
+        ];
+        var timeout = PlatformRuntime.GetValidateAuthTimeout();
+        var result = await PlatformRuntime.RunRedirectedProcessAsync(
+            qacliPath,
+            arguments,
+            workingDirectory,
+            PlatformRuntime.GetQacliOutputEncoding(),
+            timeout);
         if (result.TimedOut)
         {
-            AddIssue(errors, "VAL authentication precheck timed out (20s).");
+            AddIssue(
+                errors,
+                $"VAL authentication precheck timed out ({timeout.TotalSeconds:0}s). "
+                + $"Increase {PlatformRuntime.ValidateAuthTimeoutEnvironmentVariable} if the server is still processing.");
             return;
         }
 
@@ -1505,63 +1536,6 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
-    private static async Task<PrecheckProcessResult> RunProcessForPrecheckAsync(
-        string fileName,
-        string arguments,
-        string workingDirectory,
-        TimeSpan timeout)
-    {
-        using var process = new Process
-        {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = fileName,
-                Arguments = arguments,
-                WorkingDirectory = workingDirectory,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            }
-        };
-
-        if (!process.Start())
-        {
-            throw new InvalidOperationException($"Failed to start precheck command: {fileName}");
-        }
-
-        var stdOutTask = process.StandardOutput.ReadToEndAsync();
-        var stdErrTask = process.StandardError.ReadToEndAsync();
-        var waitTask = process.WaitForExitAsync();
-        var timeoutTask = Task.Delay(timeout);
-
-        var completedTask = await Task.WhenAny(waitTask, timeoutTask);
-        if (!ReferenceEquals(completedTask, waitTask))
-        {
-            try
-            {
-                process.Kill(entireProcessTree: true);
-            }
-            catch
-            {
-                // Ignore best-effort timeout kill failures.
-            }
-
-            await waitTask;
-            return new PrecheckProcessResult(
-                process.ExitCode,
-                await stdOutTask,
-                await stdErrTask,
-                true);
-        }
-
-        return new PrecheckProcessResult(
-            process.ExitCode,
-            await stdOutTask,
-            await stdErrTask,
-            false);
-    }
-
     private static string QuoteArgument(string value)
     {
         var escaped = (value ?? string.Empty).Replace("\"", "\\\"", StringComparison.Ordinal);
@@ -1576,10 +1550,10 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 return string.Empty;
             }
-var parts = text
-    .Split(
-        new char[] { '\r', '\n' },
-        StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var parts = text
+                .Split(
+                    new char[] { '\r', '\n' },
+                    StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             return parts.FirstOrDefault() ?? string.Empty;
         }
 
@@ -1732,6 +1706,28 @@ var parts = text
             _estimatedCommandsPerLoop = 0;
             _estimatedFixedCommandCount = 0;
             _commandDescriptionByIndex.Clear();
+
+            if (forExecution && OperatingSystem.IsLinux())
+            {
+                const string scriptCommandPath = "/usr/bin/script";
+                if (!File.Exists(scriptCommandPath))
+                {
+                    throw new FileNotFoundException(
+                        "Press [Enter] プロンプトを検出するために必要な疑似端末コマンドが見つかりません。",
+                        scriptCommandPath);
+                }
+
+                var bashCommand = $"bash {QuoteArgument(shellScript)}";
+                var scriptArguments = $"-q -e -f -E never -c {QuoteArgument(bashCommand)} /dev/null";
+                return new LaunchCommand(
+                    scriptCommandPath,
+                    scriptArguments,
+                    LinURootPath,
+                    new UTF8Encoding(false),
+                    new UTF8Encoding(false),
+                    $"script (PTY) -> bash \"{shellScript}\"");
+            }
+
             return new LaunchCommand(
                 "bash",
                 $"\"{shellScript}\"",
@@ -1928,23 +1924,31 @@ var parts = text
             StandardOutputEncoding = launch.StandardOutputEncoding,
             StandardErrorEncoding = launch.StandardErrorEncoding
         };
- if (OperatingSystem.IsLinux())
-    {
-        var editorWrapper = Path.Combine(
-            AppContext.BaseDirectory,
-            "Tools",
-            "qacli-editor-terminal.sh");
-
-        if (!File.Exists(editorWrapper))
+        if (OperatingSystem.IsLinux())
         {
-            throw new FileNotFoundException(
-                "qacli-editor-terminal.sh が見つかりません。",
-                editorWrapper);
+            var editorProxy = Environment.ProcessPath;
+            if (string.IsNullOrWhiteSpace(editorProxy) || !File.Exists(editorProxy))
+            {
+                editorProxy = Path.Combine(AppContext.BaseDirectory, "LinUCommandTestGui");
+            }
+
+            if (!File.Exists(editorProxy))
+            {
+                throw new FileNotFoundException(
+                    "GUIエディター中継実行ファイルが見つかりません。",
+                    editorProxy);
+            }
+
+            startInfo.Environment["EDITOR"] = editorProxy;
+            startInfo.Environment["VISUAL"] = editorProxy;
+            startInfo.Environment[Program.EditorProxyEnvironmentVariable] = "1";
         }
 
-        startInfo.Environment["EDITOR"] = editorWrapper;
-        startInfo.Environment["VISUAL"] = editorWrapper;
-    }
+        if (OperatingSystem.IsLinux())
+        {
+            ConfigureLinuxQacliLicenseRetry(startInfo);
+        }
+
         SetEnvironmentIfNotEmpty(startInfo, "QAF_ROOT", QafRoot);
         SetEnvironmentIfNotEmpty(startInfo, "QACLI_BIN", QacliBinPath);
         SetEnvironmentIfNotEmpty(startInfo, "TEST_ROOT", TestRoot);
@@ -1968,6 +1972,58 @@ var parts = text
         };
     }
 
+    private void ConfigureLinuxQacliLicenseRetry(ProcessStartInfo startInfo)
+    {
+        if (!TryResolveQacliExecutablePath(out var qacliPath, out var qacliError))
+        {
+            throw new InvalidOperationException(qacliError);
+        }
+
+        Directory.CreateDirectory(RuntimeDirectoryPath);
+        var retryEnvironmentPath = Path.Combine(RuntimeDirectoryPath, "qacli-license-retry.sh");
+        const string retryEnvironmentScript = """
+            # GUI runtime guard for transient Perforce QAC license contention.
+            # This file is generated automatically; edit MainWindowViewModel.cs instead.
+            qacli() {
+              local qacli_attempt=1
+              local qacli_max_attempts=4
+              local qacli_retry_wait_seconds=30
+              local qacli_rc=0
+              local qacli_output_file
+
+              qacli_output_file="$(mktemp "${TMPDIR:-/tmp}/linu-qacli.XXXXXX")" || return 1
+              while [ "$qacli_attempt" -le "$qacli_max_attempts" ]; do
+                "$LINU_REAL_QACLI" "$@" >"$qacli_output_file" 2>&1
+                qacli_rc=$?
+
+                if grep -Eiq 'ライセンスが(拒否|欠如)|ライセンス.*(不足|利用できません)|license.*(denied|refused|missing|unavailable)|communications error with license server' "$qacli_output_file"; then
+                  if [ "$qacli_attempt" -lt "$qacli_max_attempts" ]; then
+                    printf '[GUI-LICENSE-RETRY] ライセンス確保待ち: %s秒後に再試行します (%s/%s)\n' \
+                      "$qacli_retry_wait_seconds" "$qacli_attempt" "$qacli_max_attempts"
+                    rm -f "$qacli_output_file"
+                    sleep "$qacli_retry_wait_seconds"
+                    qacli_output_file="$(mktemp "${TMPDIR:-/tmp}/linu-qacli.XXXXXX")" || return 1
+                    qacli_attempt=$((qacli_attempt + 1))
+                    continue
+                  fi
+                fi
+
+                cat "$qacli_output_file"
+                rm -f "$qacli_output_file"
+                return "$qacli_rc"
+              done
+
+              rm -f "$qacli_output_file"
+              return "$qacli_rc"
+            }
+            export -f qacli
+            """;
+
+        File.WriteAllText(retryEnvironmentPath, retryEnvironmentScript, Utf8WithoutBom);
+        startInfo.Environment["BASH_ENV"] = retryEnvironmentPath;
+        startInfo.Environment["LINU_REAL_QACLI"] = qacliPath;
+    }
+
     private void HandleProcessOutputLine(string? line, bool isError)
     {
         if (string.IsNullOrWhiteSpace(line))
@@ -1975,22 +2031,171 @@ var parts = text
             return;
         }
 
-        Dispatcher.UIThread.Post(() =>
+        _pendingProcessOutputLines.Enqueue((line, isError, DateTime.UtcNow));
+    }
+
+    private async Task PumpProcessStreamAsync(StreamReader reader, bool isError)
+    {
+        var pendingText = new StringBuilder();
+        var buffer = new char[2048];
+
+        while (true)
         {
-            var normalizedLine = line.Trim();
-            _observedOutputLineCount += 1;
-            _lastOutputUtc = DateTime.UtcNow;
-            LastOutputTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-            LastOutputAgeSeconds = 0;
-            OutputActivity = GetOutputActivityText(isActive: true);
+            var charactersRead = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length));
+            if (charactersRead == 0)
+            {
+                break;
+            }
+
+            pendingText.Append(buffer, 0, charactersRead);
+            DrainProcessText(pendingText, isError, flushRemainder: false);
+        }
+
+        DrainProcessText(pendingText, isError, flushRemainder: true);
+    }
+
+    private void DrainProcessText(StringBuilder pendingText, bool isError, bool flushRemainder)
+    {
+        while (pendingText.Length > 0)
+        {
+            var text = pendingText.ToString();
+            var lineBreakIndex = FindFirstLineBreakIndex(text);
+            var promptEndIndex = FindPromptEndIndex(text);
+
+            if (lineBreakIndex >= 0
+                && (promptEndIndex < 0 || lineBreakIndex < promptEndIndex))
+            {
+                var line = text[..lineBreakIndex];
+                var removeLength = lineBreakIndex + 1;
+                if (text[lineBreakIndex] == '\r'
+                    && removeLength < text.Length
+                    && text[removeLength] == '\n')
+                {
+                    removeLength += 1;
+                }
+
+                pendingText.Remove(0, removeLength);
+                HandleProcessOutputLine(line, isError);
+                continue;
+            }
+
+            if (promptEndIndex >= 0)
+            {
+                // Bash read -p writes its prompt without a trailing newline. Emit it as soon as
+                // the actual prompt text is observed; this is the only trigger for auto-Enter.
+                var promptText = text[..promptEndIndex];
+                pendingText.Remove(0, promptEndIndex);
+                HandleProcessOutputLine(promptText, isError);
+                continue;
+            }
+
+            if (flushRemainder)
+            {
+                pendingText.Clear();
+                HandleProcessOutputLine(text, isError);
+            }
+
+            return;
+        }
+    }
+
+    private static int FindFirstLineBreakIndex(string text)
+    {
+        var carriageReturnIndex = text.IndexOf('\r');
+        var lineFeedIndex = text.IndexOf('\n');
+        if (carriageReturnIndex < 0)
+        {
+            return lineFeedIndex;
+        }
+
+        return lineFeedIndex < 0
+            ? carriageReturnIndex
+            : Math.Min(carriageReturnIndex, lineFeedIndex);
+    }
+
+    private static int FindPromptEndIndex(string text)
+    {
+        string[] promptTokens =
+        [
+            "Press [Enter] to continue.",
+            "Press [Enter] to start!",
+            "Press [Enter]",
+            "press any key",
+            "続行するには何かキー",
+            "何かキーを押してください",
+            "邯夊｡後☆繧九↓縺ｯ菴輔°繧ｭ繝ｼ"
+        ];
+
+        var earliestStart = int.MaxValue;
+        var selectedLength = 0;
+        foreach (var token in promptTokens)
+        {
+            var tokenIndex = text.IndexOf(token, StringComparison.OrdinalIgnoreCase);
+            if (tokenIndex < 0)
+            {
+                continue;
+            }
+
+            if (tokenIndex < earliestStart
+                || tokenIndex == earliestStart && token.Length > selectedLength)
+            {
+                earliestStart = tokenIndex;
+                selectedLength = token.Length;
+            }
+        }
+
+        return earliestStart == int.MaxValue
+            ? -1
+            : earliestStart + selectedLength;
+    }
+
+    private void StartProcessOutputPump()
+    {
+        while (_pendingProcessOutputLines.TryDequeue(out _))
+        {
+        }
+
+        _processOutputFlushTimer.Start();
+    }
+
+    private void StopProcessOutputPump()
+    {
+        _processOutputFlushTimer.Stop();
+        FlushPendingProcessOutputLines(int.MaxValue);
+    }
+
+    private void FlushPendingProcessOutputLines(int maximumLines = MaxProcessOutputLinesPerFlush)
+    {
+        if (_pendingProcessOutputLines.IsEmpty)
+        {
+            return;
+        }
+
+        var liveOutputBatch = new StringBuilder();
+        var runLogBatch = new List<string>();
+        var processedCount = 0;
+        var latestOutputUtc = DateTime.MinValue;
+
+        while (processedCount < maximumLines
+               && _pendingProcessOutputLines.TryDequeue(out var output))
+        {
+            processedCount += 1;
+            latestOutputUtc = output.ReceivedUtc;
+            var normalizedLine = output.Line.Trim();
 
             if (TryHandleRuntimeTelemetryLine(normalizedLine))
             {
-                return;
+                continue;
             }
 
             _lastOutputLine = normalizedLine;
-            AppendLog(line, isError, false);
+            AddLogEntry(output.Line, output.IsError, false);
+            if (liveOutputBatch.Length > 0)
+            {
+                liveOutputBatch.AppendLine();
+            }
+
+            liveOutputBatch.Append(output.Line);
             UpdateRealtimeProgressFromOutput(normalizedLine);
 
             var failureDetected = IsFailureOutputLine(normalizedLine);
@@ -2012,13 +2217,32 @@ var parts = text
                 RecordErrorFinding(normalizedLine);
             }
 
-            if (AutoConfirmPrompts && IsPausePrompt(line))
+            if (AutoConfirmPrompts && IsPausePrompt(output.Line))
             {
-                _ = SendAutoConfirmAsync("prompt");
+                _ = SendAutoConfirmAsync();
             }
 
-            _ = AppendRunLogLineAsync(line);
-        });
+            runLogBatch.Add(output.Line);
+        }
+
+        _observedOutputLineCount += processedCount;
+        if (latestOutputUtc != DateTime.MinValue)
+        {
+            _lastOutputUtc = latestOutputUtc;
+            LastOutputTime = latestOutputUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+            LastOutputAgeSeconds = 0;
+            OutputActivity = GetOutputActivityText(isActive: true);
+        }
+
+        if (liveOutputBatch.Length > 0)
+        {
+            AppendLiveOutputBatch(liveOutputBatch.ToString());
+        }
+
+        if (runLogBatch.Count > 0)
+        {
+            _ = AppendRunLogLinesAsync(runLogBatch);
+        }
     }
 
     private bool TryHandleRuntimeTelemetryLine(string line)
@@ -2258,47 +2482,12 @@ var parts = text
         }
     }
 
-    private void StartAutoConfirmLoop()
-    {
-        _autoConfirmLoopCts?.Cancel();
-        _autoConfirmLoopCts?.Dispose();
-        _autoConfirmLoopCts = new CancellationTokenSource();
-        _autoConfirmLoopTask = RunAutoConfirmLoopAsync(_autoConfirmLoopCts.Token);
-    }
-
     private void StartRuntimeStatusLoop()
     {
         _runtimeStatusLoopCts?.Cancel();
         _runtimeStatusLoopCts?.Dispose();
         _runtimeStatusLoopCts = new CancellationTokenSource();
         _runtimeStatusLoopTask = RunRuntimeStatusLoopAsync(_runtimeStatusLoopCts.Token);
-    }
-
-    private async Task StopAutoConfirmLoopAsync()
-    {
-        if (_autoConfirmLoopCts is null)
-        {
-            return;
-        }
-
-        try
-        {
-            _autoConfirmLoopCts.Cancel();
-            if (_autoConfirmLoopTask is not null)
-            {
-                await _autoConfirmLoopTask;
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected when cancellation happens while waiting delay.
-        }
-        finally
-        {
-            _autoConfirmLoopCts.Dispose();
-            _autoConfirmLoopCts = null;
-            _autoConfirmLoopTask = null;
-        }
     }
 
     private async Task StopRuntimeStatusLoopAsync()
@@ -2398,39 +2587,6 @@ var parts = text
         }
     }
 
-    private async Task RunAutoConfirmLoopAsync(CancellationToken cancellationToken)
-    {
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            await Task.Delay(500, cancellationToken);
-
-            if (!AutoConfirmPrompts)
-            {
-                continue;
-            }
-
-            var process = _runningProcess;
-            if (process is null || process.HasExited)
-            {
-                return;
-            }
-
-            var cadenceMs = Math.Max(1000, PromptDelayMilliseconds);
-            var now = DateTime.UtcNow;
-            if ((now - _lastOutputUtc).TotalMilliseconds < cadenceMs)
-            {
-                continue;
-            }
-
-            if ((now - _lastAutoConfirmSentUtc).TotalMilliseconds < cadenceMs)
-            {
-                continue;
-            }
-
-            await SendAutoConfirmAsync("watchdog");
-        }
-    }
-
     private async Task RunRuntimeStatusLoopAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -2469,50 +2625,82 @@ var parts = text
         }
     }
 
-    private async Task SendAutoConfirmAsync(string reason = "prompt")
+    private async Task SendAutoConfirmAsync()
     {
-        var process = _runningProcess;
-        if (process is null || process.HasExited)
+        var requestedProcess = _runningProcess;
+        if (requestedProcess is null || requestedProcess.HasExited)
         {
             return;
         }
 
+        await _autoConfirmSemaphore.WaitAsync();
         try
         {
+            var process = _runningProcess;
+            if (process is null
+                || process.HasExited
+                || !ReferenceEquals(process, requestedProcess))
+            {
+                return;
+            }
+
+            // Honor the delay shown in the GUI after the actual prompt was observed.
+            if (PromptDelayMilliseconds > 0)
+            {
+                await Task.Delay(PromptDelayMilliseconds);
+                process = _runningProcess;
+                if (process is null
+                    || process.HasExited
+                    || !ReferenceEquals(process, requestedProcess))
+                {
+                    return;
+                }
+            }
+
             await process.StandardInput.WriteLineAsync(string.Empty);
             await process.StandardInput.FlushAsync();
-            _lastAutoConfirmSentUtc = DateTime.UtcNow;
 
             AutoEnterCount += 1;
-            if (!string.Equals(reason, "watchdog", StringComparison.Ordinal))
-            {
-                const string message = "[GUI] Auto-confirm sent.";
-                AppendLog(message, false, true);
-                await AppendRunLogLineAsync(message);
-            }
+            const string message = "[GUI] Auto-confirm sent after prompt detection.";
+            AppendLog(message, false, true);
+            await AppendRunLogLineAsync(message);
         }
         catch
         {
             // Ignore stdin write failures when process is terminating.
         }
+        finally
+        {
+            _autoConfirmSemaphore.Release();
+        }
     }
 
-    private async Task AppendRunLogLineAsync(string text)
+    private Task AppendRunLogLineAsync(string text)
     {
-        if (IsInternalGuiTraceLine(text))
+        return AppendRunLogLinesAsync([text]);
+    }
+
+    private async Task AppendRunLogLinesAsync(IReadOnlyList<string> lines)
+    {
+        var filteredLines = lines
+            .Where(line => !string.IsNullOrWhiteSpace(line) && !IsInternalGuiTraceLine(line))
+            .ToArray();
+        if (filteredLines.Length == 0)
         {
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(CurrentRunLogPath))
+        var logPath = CurrentRunLogPath;
+        if (string.IsNullOrWhiteSpace(logPath))
         {
             return;
         }
 
+        var text = string.Join(Environment.NewLine, filteredLines) + Environment.NewLine;
         await _logWriteSemaphore.WaitAsync();
         try
         {
-            await File.AppendAllTextAsync(CurrentRunLogPath, text + Environment.NewLine, new UTF8Encoding(false));
+            await File.AppendAllTextAsync(logPath, text, Utf8WithoutBom);
         }
         catch
         {
@@ -2914,6 +3102,15 @@ var parts = text
         EstimatedFinishTime = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
     }
 
+    private void CompleteFinishedScriptProgress()
+    {
+        LoopStartedCount = Math.Max(LoopStartedCount, ConfiguredLoopCount);
+        LoopCompletedCount = Math.Max(LoopCompletedCount, ConfiguredLoopCount);
+        ProgressPercentage = 100;
+        UpdateProgressTextDisplay();
+        UpdateEstimatedTimeDisplay(DateTime.UtcNow - _runStartedUtc);
+    }
+
     private void TryApplyGuiLoopMarker(string line)
     {
         var match = GuiLoopMarkerRegex.Match(line);
@@ -2930,28 +3127,28 @@ var parts = text
         switch (markerType)
         {
             case "START":
-            {
-                var started = hasIndex ? markerIndex : LoopStartedCount + 1;
-                LoopStartedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopStartedCount, started));
-                _loopStartedUtcByIndex[LoopStartedCount] = nowUtc;
-                break;
-            }
+                {
+                    var started = hasIndex ? markerIndex : LoopStartedCount + 1;
+                    LoopStartedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopStartedCount, started));
+                    _loopStartedUtcByIndex[LoopStartedCount] = nowUtc;
+                    break;
+                }
             case "DONE":
-            {
-                var completed = hasIndex ? markerIndex : LoopCompletedCount + 1;
-                LoopCompletedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopCompletedCount, completed));
-                LoopStartedCount = Math.Max(LoopStartedCount, LoopCompletedCount);
-                RecordLoopDurationIfAvailable(completed, nowUtc, "DONE");
-                break;
-            }
+                {
+                    var completed = hasIndex ? markerIndex : LoopCompletedCount + 1;
+                    LoopCompletedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopCompletedCount, completed));
+                    LoopStartedCount = Math.Max(LoopStartedCount, LoopCompletedCount);
+                    RecordLoopDurationIfAvailable(completed, nowUtc, "DONE");
+                    break;
+                }
             case "FAIL":
-            {
-                var failed = hasIndex ? markerIndex : LoopFailedCount + 1;
-                LoopFailedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopFailedCount, failed));
-                LoopStartedCount = Math.Max(LoopStartedCount, LoopFailedCount);
-                RecordLoopDurationIfAvailable(failed, nowUtc, "FAIL");
-                break;
-            }
+                {
+                    var failed = hasIndex ? markerIndex : LoopFailedCount + 1;
+                    LoopFailedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopFailedCount, failed));
+                    LoopStartedCount = Math.Max(LoopStartedCount, LoopFailedCount);
+                    RecordLoopDurationIfAvailable(failed, nowUtc, "FAIL");
+                    break;
+                }
         }
 
         var markerProgress = (Math.Min(LoopCompletedCount, ConfiguredLoopCount) * 100.0) / ConfiguredLoopCount;
@@ -3490,21 +3687,43 @@ var parts = text
             return;
         }
 
+        AddLogEntry(text, isError, isCommand);
+        AppendLiveOutputBatch(text);
+    }
+
+    private void AddLogEntry(string text, bool isError, bool isCommand)
+    {
         LogLines.Add(new LiveLogEntry(text, isError, isCommand));
 
         if (LogLines.Count > 4000)
         {
-            LogLines.RemoveAt(0);
+            LogLines.Clear();
+        }
+    }
+
+    private void AppendLiveOutputBatch(string text)
+    {
+        var updatedText = LiveOutputText.Length == 0
+            ? text
+            : LiveOutputText + Environment.NewLine + text;
+        if (updatedText.Length <= MaxLiveOutputCharacters)
+        {
+            LiveOutputText = updatedText;
+            return;
         }
 
-        if (LiveOutputText.Length == 0)
+        var firstCharacterToKeep = updatedText.Length - MaxLiveOutputCharacters;
+        var firstCompleteLine = updatedText.IndexOf('\n', firstCharacterToKeep);
+        if (firstCompleteLine < 0)
         {
-            LiveOutputText = text;
+            firstCompleteLine = firstCharacterToKeep;
         }
-        else
-        {
-            LiveOutputText += Environment.NewLine + text;
-        }
+
+        var retainedText = updatedText[(firstCompleteLine + 1)..];
+        var omittedMessage = LocalizeText(
+            "[GUI表示の古いログを省略しました。完全なログは実行ログファイルに保存されています。]",
+            "[Older GUI output omitted. The complete output is saved in the run log file.]");
+        LiveOutputText = omittedMessage + Environment.NewLine + retainedText;
     }
 
     private static bool IsInternalGuiTraceLine(string text)
@@ -3759,12 +3978,6 @@ var parts = text
         int FixedCommandCount,
         Dictionary<int, string> CommandDescriptionByIndex);
 
-    private sealed record PrecheckProcessResult(
-        int ExitCode,
-        string StdOut,
-        string StdErr,
-        bool TimedOut);
-
     private sealed record ErrorInsight(
         string Category,
         string Explanation,
@@ -3898,9 +4111,9 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
             ["StartTest"] = "テスト開始",
             ["Stop"] = "停止",
             ["ClearGuiLog"] = "GUIログクリア",
-            ["AutoConfirm"] = "Press [Enter] を自動入力",
+            ["AutoConfirm"] = "Press [Enter] 検出時のみ自動入力",
             ["StopOnError"] = "最初のエラーで停止",
-            ["PromptDelay"] = "入力待ち遅延 (ms)",
+            ["PromptDelay"] = "検出後の入力遅延 (ms)",
             ["AutoEnterCount"] = "自動入力回数",
             ["Status"] = "ステータス",
             ["RunResult"] = "実行結果",
@@ -3959,9 +4172,9 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
             ["StartTest"] = "Start Test",
             ["Stop"] = "Stop",
             ["ClearGuiLog"] = "Clear GUI Log",
-            ["AutoConfirm"] = "Auto-confirm 'Press [Enter]'",
+            ["AutoConfirm"] = "Auto-confirm only after detecting 'Press [Enter]'",
             ["StopOnError"] = "Stop on first error",
-            ["PromptDelay"] = "Prompt delay (ms)",
+            ["PromptDelay"] = "Delay after detection (ms)",
             ["AutoEnterCount"] = "Auto-enter count",
             ["Status"] = "Status",
             ["RunResult"] = "Run Result",
@@ -4033,4 +4246,3 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs("Item"));
     }
 }
-

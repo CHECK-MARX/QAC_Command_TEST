@@ -70,6 +70,13 @@
 ### 8. 表示言語切替
 - 日本語 / 英語のUI切替に対応します。
 
+### 9. クロスプラットフォーム事前確認
+- Validate 認証の事前確認タイムアウトは既定で60秒です。
+- 必要な場合は環境変数 `LINU_VAL_AUTH_TIMEOUT_SECONDS` で10～600秒に変更できます。
+- Windows版 `qacli` の出力はCP932、Linux版はUTF-8として読み取ります。
+- 認証引数はシェル文字列へ連結せず、個別のプロセス引数として渡します。
+- ウィンドウタイトルとヘッダーに、アプリのバージョン・Gitコミット短縮SHA・実行RIDを表示します（ローカルビルドは `local` と表示）。
+
 ## ビルド
 
 ```bash
@@ -87,8 +94,10 @@ dotnet build -c Release
   - Pull Request
   - 手動実行 (`workflow_dispatch`)
 - 生成物:
-  - Windows: `LinUCommandTestGui-win-x64.zip`
-  - Linux: `LinUCommandTestGui-linux-x64.tar.gz`
+  - Windows: `LinUCommandTestGui-win-x64-<commit-sha>.zip`
+  - Linux: `LinUCommandTestGui-linux-x64-<commit-sha>.tar.gz`
+
+CIはWindowsとLinuxの両方でクロスプラットフォームテストを実行し、成功した場合だけ配布物を生成します。
 
 GitHub の Actions 実行結果画面から、Artifacts としてダウンロードできます。
 
@@ -105,3 +114,4 @@ dotnet run -c Release
 - Linux は `testonce.sh` / `testloop.sh` / `master_settings` がある構成を前提にします。
 - Windows は `test_loop.bat`（または `testloop.bat`）を前提にし、環境値も `.bat` 側を読み書きします。
 - 疑似端末 (`script`) が使える環境では、手動実行に近い表示モードで起動します。
+- 同じGitコミットSHAのWindows/Linux成果物を組み合わせて使用してください。

@@ -5,7 +5,14 @@
     <Nullable>enable</Nullable>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    <BuildSourceRevision Condition="'$(BuildSourceRevision)' == '' and '$(GITHUB_SHA)' != ''">$(GITHUB_SHA)</BuildSourceRevision>
+    <BuildSourceRevision Condition="'$(BuildSourceRevision)' == ''">local</BuildSourceRevision>
   </PropertyGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="BuildSourceRevision" Value="$(BuildSourceRevision)" />
+  </ItemGroup>
 
   <ItemGroup>
     <Folder Include="Models\" />
@@ -21,10 +28,5 @@
       <PrivateAssets Condition="'$(Configuration)' != 'Debug'">All</PrivateAssets>
     </PackageReference>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.1" />
-  </ItemGroup>
-    <ItemGroup>
-    <None Update="Tools/qacli-editor-terminal.sh"
-          CopyToOutputDirectory="PreserveNewest"
-          CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
