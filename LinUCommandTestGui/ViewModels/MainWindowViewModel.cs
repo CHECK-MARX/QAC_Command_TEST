@@ -16,6 +16,7 @@ using System.Threading.Tasks;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using LinUCommandTestGui;
 
 namespace LinUCommandTestGui.ViewModels;
 
@@ -328,6 +329,7 @@ public partial class MainWindowViewModel : ViewModelBase
         OnPropertyChanged(nameof(ErrorLastSeenLabel));
         OnPropertyChanged(nameof(ErrorExplanationLabel));
         OnPropertyChanged(nameof(ErrorHintLabel));
+        OnPropertyChanged(nameof(HeaderTitleWithBuild));
     }
 
     private bool IsJapaneseUiLanguage()
@@ -362,6 +364,8 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     public string PrecheckButtonText => LocalizeText("\u4E8B\u524D\u78BA\u8A8D", "Precheck");
+
+    public string HeaderTitleWithBuild => $"{T["HeaderTitle"]}  {PlatformRuntime.BuildIdentity}";
 
     public string ErrorAnalysisTabTitle => LocalizeText("\u30A8\u30E9\u30FC\u89E3\u6790", "Error Analysis");
 
@@ -1482,11 +1486,30 @@ public partial class MainWindowViewModel : ViewModelBase
             ? LinURootPath
             : Directory.GetCurrentDirectory();
 
-        var arguments = $"auth --validate --username {QuoteArgument(ValUser)} --password {QuoteArgument(ValPass)} --url {QuoteArgument(ValServer)}";
-        var result = await RunProcessForPrecheckAsync(qacliPath, arguments, workingDirectory, TimeSpan.FromSeconds(20));
+        string[] arguments =
+        [
+            "auth",
+            "--validate",
+            "--username",
+            ValUser,
+            "--password",
+            ValPass,
+            "--url",
+            ValServer
+        ];
+        var timeout = PlatformRuntime.GetValidateAuthTimeout();
+        var result = await PlatformRuntime.RunRedirectedProcessAsync(
+            qacliPath,
+            arguments,
+            workingDirectory,
+            PlatformRuntime.GetQacliOutputEncoding(),
+            timeout);
         if (result.TimedOut)
         {
-            AddIssue(errors, "VAL authentication precheck timed out (20s).");
+            AddIssue(
+                errors,
+                $"VAL authentication precheck timed out ({timeout.TotalSeconds:0}s). "
+                + $"Increase {PlatformRuntime.ValidateAuthTimeoutEnvironmentVariable} if the server is still processing.");
             return;
         }
 
@@ -1513,63 +1536,6 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
-    private static async Task<PrecheckProcessResult> RunProcessForPrecheckAsync(
-        string fileName,
-        string arguments,
-        string workingDirectory,
-        TimeSpan timeout)
-    {
-        using var process = new Process
-        {
-            StartInfo = new ProcessStartInfo
-            {
-                FileName = fileName,
-                Arguments = arguments,
-                WorkingDirectory = workingDirectory,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            }
-        };
-
-        if (!process.Start())
-        {
-            throw new InvalidOperationException($"Failed to start precheck command: {fileName}");
-        }
-
-        var stdOutTask = process.StandardOutput.ReadToEndAsync();
-        var stdErrTask = process.StandardError.ReadToEndAsync();
-        var waitTask = process.WaitForExitAsync();
-        var timeoutTask = Task.Delay(timeout);
-
-        var completedTask = await Task.WhenAny(waitTask, timeoutTask);
-        if (!ReferenceEquals(completedTask, waitTask))
-        {
-            try
-            {
-                process.Kill(entireProcessTree: true);
-            }
-            catch
-            {
-                // Ignore best-effort timeout kill failures.
-            }
-
-            await waitTask;
-            return new PrecheckProcessResult(
-                process.ExitCode,
-                await stdOutTask,
-                await stdErrTask,
-                true);
-        }
-
-        return new PrecheckProcessResult(
-            process.ExitCode,
-            await stdOutTask,
-            await stdErrTask,
-            false);
-    }
-
     private static string QuoteArgument(string value)
     {
         var escaped = (value ?? string.Empty).Replace("\"", "\\\"", StringComparison.Ordinal);
@@ -1584,10 +1550,10 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 return string.Empty;
             }
-var parts = text
-    .Split(
-        new char[] { '\r', '\n' },
-        StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var parts = text
+                .Split(
+                    new char[] { '\r', '\n' },
+                    StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             return parts.FirstOrDefault() ?? string.Empty;
         }
 
@@ -3161,28 +3127,28 @@ var parts = text
         switch (markerType)
         {
             case "START":
-            {
-                var started = hasIndex ? markerIndex : LoopStartedCount + 1;
-                LoopStartedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopStartedCount, started));
-                _loopStartedUtcByIndex[LoopStartedCount] = nowUtc;
-                break;
-            }
+                {
+                    var started = hasIndex ? markerIndex : LoopStartedCount + 1;
+                    LoopStartedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopStartedCount, started));
+                    _loopStartedUtcByIndex[LoopStartedCount] = nowUtc;
+                    break;
+                }
             case "DONE":
-            {
-                var completed = hasIndex ? markerIndex : LoopCompletedCount + 1;
-                LoopCompletedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopCompletedCount, completed));
-                LoopStartedCount = Math.Max(LoopStartedCount, LoopCompletedCount);
-                RecordLoopDurationIfAvailable(completed, nowUtc, "DONE");
-                break;
-            }
+                {
+                    var completed = hasIndex ? markerIndex : LoopCompletedCount + 1;
+                    LoopCompletedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopCompletedCount, completed));
+                    LoopStartedCount = Math.Max(LoopStartedCount, LoopCompletedCount);
+                    RecordLoopDurationIfAvailable(completed, nowUtc, "DONE");
+                    break;
+                }
             case "FAIL":
-            {
-                var failed = hasIndex ? markerIndex : LoopFailedCount + 1;
-                LoopFailedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopFailedCount, failed));
-                LoopStartedCount = Math.Max(LoopStartedCount, LoopFailedCount);
-                RecordLoopDurationIfAvailable(failed, nowUtc, "FAIL");
-                break;
-            }
+                {
+                    var failed = hasIndex ? markerIndex : LoopFailedCount + 1;
+                    LoopFailedCount = Math.Min(ConfiguredLoopCount, Math.Max(LoopFailedCount, failed));
+                    LoopStartedCount = Math.Max(LoopStartedCount, LoopFailedCount);
+                    RecordLoopDurationIfAvailable(failed, nowUtc, "FAIL");
+                    break;
+                }
         }
 
         var markerProgress = (Math.Min(LoopCompletedCount, ConfiguredLoopCount) * 100.0) / ConfiguredLoopCount;
@@ -4011,12 +3977,6 @@ var parts = text
         int CommandsPerLoop,
         int FixedCommandCount,
         Dictionary<int, string> CommandDescriptionByIndex);
-
-    private sealed record PrecheckProcessResult(
-        int ExitCode,
-        string StdOut,
-        string StdErr,
-        bool TimedOut);
 
     private sealed record ErrorInsight(
         string Category,

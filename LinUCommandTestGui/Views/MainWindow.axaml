@@ -8,7 +8,7 @@
         d:DesignHeight="900"
         x:Class="LinUCommandTestGui.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
-        Title="{Binding T[HeaderTitle]}">
+        Title="{Binding HeaderTitleWithBuild}">
 
     <Window.Styles>
         <Style Selector="TextBlock.log-error">
@@ -27,7 +27,7 @@
                            VerticalAlignment="Center"
                            FontWeight="SemiBold"
                            Foreground="White"
-                           Text="{Binding T[HeaderTitle]}" />
+                           Text="{Binding HeaderTitleWithBuild}" />
 
                 <TextBlock Grid.Column="1"
                            VerticalAlignment="Center"
