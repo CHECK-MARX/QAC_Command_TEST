@@ -8,7 +8,12 @@
         d:DesignHeight="900"
         x:Class="LinUCommandTestGui.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
-        Title="{Binding HeaderTitleWithBuild}">
+        Title="{Binding HeaderTitleWithBuild}"
+        Width="1400"
+        Height="900"
+        MinWidth="900"
+        MinHeight="600"
+        CanResize="True">
 
     <Window.Styles>
         <Style Selector="TextBlock.log-error">
@@ -290,73 +295,17 @@
                 </Border>
 
                 <Border Grid.Row="1" BorderBrush="#D0D0D0" BorderThickness="1" Padding="10" CornerRadius="4">
-                    <TabControl>
-                        <TabItem Header="{Binding T[SectionLiveOutput]}">
-                            <Grid RowDefinitions="Auto,*" RowSpacing="8">
-                                <WrapPanel Grid.Row="0">
-                                    <CheckBox IsChecked="{Binding AutoScrollLiveOutput}"
-                                              Content="{Binding T[AutoScrollLiveOutput]}"
-                                              VerticalAlignment="Center"
-                                              Margin="0,0,12,0" />
-                                    <Button Click="OnCopySelectedLiveOutputClick"
-                                            Content="{Binding T[CopySelectedLog]}" />
-                                </WrapPanel>
-                                <Border Grid.Row="1" BorderBrush="#CFCFCF" BorderThickness="1" CornerRadius="4">
-                                    <TextBox x:Name="LiveOutputTextBox"
-                                             Text="{Binding LiveOutputText, Mode=OneWay}"
-                                             IsReadOnly="True"
-                                             AcceptsReturn="True"
-                                             TextWrapping="NoWrap"
-                                             VerticalAlignment="Stretch"
-                                             ScrollViewer.HorizontalScrollBarVisibility="Auto"
-                                             ScrollViewer.VerticalScrollBarVisibility="Auto" />
-                                </Border>
-                            </Grid>
-                        </TabItem>
-
-                        <TabItem Header="{Binding ErrorAnalysisTabTitle}">
-                            <Grid RowDefinitions="Auto,*" RowSpacing="8">
-                                <WrapPanel Grid.Row="0">
-                                    <TextBlock Text="{Binding ExtractedErrorCountLabel}" Margin="0,0,8,0" />
-                                    <TextBlock Text="{Binding ExtractedErrorCount}" FontWeight="Bold" />
-                                </WrapPanel>
-
-                                <Border Grid.Row="1" BorderBrush="#CFCFCF" BorderThickness="1" CornerRadius="4">
-                                    <ListBox ItemsSource="{Binding ErrorFindings}">
-                                        <ListBox.ItemTemplate>
-                                            <DataTemplate x:DataType="vm:ParsedErrorItemViewModel">
-                                                <Border Margin="4,4,4,2" Padding="8" BorderBrush="#5A5A5A" BorderThickness="1" CornerRadius="4">
-                                                    <StackPanel Spacing="4">
-                                                        <TextBlock Foreground="#D12F2F" FontWeight="SemiBold" Text="{Binding ErrorText}" TextWrapping="Wrap" />
-                                                        <WrapPanel>
-                                                            <TextBlock Text="{Binding $parent[Window].DataContext.ErrorCategoryLabel}" Margin="0,0,6,0" />
-                                                            <TextBlock Text="{Binding Category}" FontWeight="SemiBold" />
-                                                            <TextBlock Margin="14,0,6,0" Text="{Binding $parent[Window].DataContext.ErrorOccurrencesLabel}" />
-                                                            <TextBlock Text="{Binding Occurrences}" FontWeight="SemiBold" />
-                                                        </WrapPanel>
-                                                        <WrapPanel>
-                                                            <TextBlock Text="{Binding $parent[Window].DataContext.ErrorFirstSeenLabel}" Margin="0,0,6,0" />
-                                                            <TextBlock Text="{Binding FirstSeenTime}" />
-                                                            <TextBlock Margin="14,0,6,0" Text="{Binding $parent[Window].DataContext.ErrorLastSeenLabel}" />
-                                                            <TextBlock Text="{Binding LastSeenTime}" />
-                                                        </WrapPanel>
-                                                        <WrapPanel>
-                                                            <TextBlock Text="{Binding $parent[Window].DataContext.ErrorExplanationLabel}" Margin="0,0,6,0" />
-                                                            <TextBlock Text="{Binding Explanation}" TextWrapping="Wrap" />
-                                                        </WrapPanel>
-                                                        <WrapPanel>
-                                                            <TextBlock Text="{Binding $parent[Window].DataContext.ErrorHintLabel}" Margin="0,0,6,0" />
-                                                            <TextBlock Text="{Binding Hint}" TextWrapping="Wrap" />
-                                                        </WrapPanel>
-                                                    </StackPanel>
-                                                </Border>
-                                            </DataTemplate>
-                                        </ListBox.ItemTemplate>
-                                    </ListBox>
-                                </Border>
-                            </Grid>
-                        </TabItem>
-                    </TabControl>
+                    <StackPanel Spacing="10">
+                        <TextBlock FontWeight="Bold" Text="{Binding T[DetachedViews]}" />
+                        <TextBlock Text="{Binding T[DetachedViewsHint]}" TextWrapping="Wrap" />
+                        <WrapPanel>
+                            <Button Click="OnOpenLiveOutputWindowClick"
+                                    Content="{Binding T[OpenLiveOutputWindow]}"
+                                    Margin="0,0,8,0" />
+                            <Button Click="OnOpenErrorAnalysisWindowClick"
+                                    Content="{Binding T[OpenErrorAnalysisWindow]}" />
+                        </WrapPanel>
+                    </StackPanel>
                 </Border>
             </Grid>
         </Grid>

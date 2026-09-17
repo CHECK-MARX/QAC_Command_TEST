@@ -1,0 +1,51 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:LinUCommandTestGui.ViewModels"
+        x:Class="LinUCommandTestGui.Views.ErrorAnalysisWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="{Binding ErrorAnalysisTabTitle}"
+        Width="900"
+        Height="650"
+        MinWidth="450"
+        MinHeight="250"
+        CanResize="True">
+    <Grid Margin="12" RowDefinitions="Auto,*" RowSpacing="8">
+        <WrapPanel Grid.Row="0">
+            <TextBlock Text="{Binding ExtractedErrorCountLabel}" Margin="0,0,8,0" />
+            <TextBlock Text="{Binding ExtractedErrorCount}" FontWeight="Bold" />
+        </WrapPanel>
+        <Border Grid.Row="1" BorderBrush="#CFCFCF" BorderThickness="1" CornerRadius="4">
+            <ListBox ItemsSource="{Binding ErrorFindings}">
+                <ListBox.ItemTemplate>
+                    <DataTemplate x:DataType="vm:ParsedErrorItemViewModel">
+                        <Border Margin="4,4,4,2" Padding="8" BorderBrush="#5A5A5A" BorderThickness="1" CornerRadius="4">
+                            <StackPanel Spacing="4">
+                                <TextBlock Foreground="#D12F2F" FontWeight="SemiBold" Text="{Binding ErrorText}" TextWrapping="Wrap" />
+                                <WrapPanel>
+                                    <TextBlock Text="{Binding $parent[Window].DataContext.ErrorCategoryLabel}" Margin="0,0,6,0" />
+                                    <TextBlock Text="{Binding Category}" FontWeight="SemiBold" />
+                                    <TextBlock Margin="14,0,6,0" Text="{Binding $parent[Window].DataContext.ErrorOccurrencesLabel}" />
+                                    <TextBlock Text="{Binding Occurrences}" FontWeight="SemiBold" />
+                                </WrapPanel>
+                                <WrapPanel>
+                                    <TextBlock Text="{Binding $parent[Window].DataContext.ErrorFirstSeenLabel}" Margin="0,0,6,0" />
+                                    <TextBlock Text="{Binding FirstSeenTime}" />
+                                    <TextBlock Margin="14,0,6,0" Text="{Binding $parent[Window].DataContext.ErrorLastSeenLabel}" />
+                                    <TextBlock Text="{Binding LastSeenTime}" />
+                                </WrapPanel>
+                                <WrapPanel>
+                                    <TextBlock Text="{Binding $parent[Window].DataContext.ErrorExplanationLabel}" Margin="0,0,6,0" />
+                                    <TextBlock Text="{Binding Explanation}" TextWrapping="Wrap" />
+                                </WrapPanel>
+                                <WrapPanel>
+                                    <TextBlock Text="{Binding $parent[Window].DataContext.ErrorHintLabel}" Margin="0,0,6,0" />
+                                    <TextBlock Text="{Binding Hint}" TextWrapping="Wrap" />
+                                </WrapPanel>
+                            </StackPanel>
+                        </Border>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+        </Border>
+    </Grid>
+</Window>

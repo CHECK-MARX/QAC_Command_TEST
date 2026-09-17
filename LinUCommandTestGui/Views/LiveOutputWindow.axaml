@@ -1,0 +1,32 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:LinUCommandTestGui.ViewModels"
+        x:Class="LinUCommandTestGui.Views.LiveOutputWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="{Binding T[SectionLiveOutput]}"
+        Width="1000"
+        Height="650"
+        MinWidth="450"
+        MinHeight="250"
+        CanResize="True">
+    <Grid Margin="12" RowDefinitions="Auto,*" RowSpacing="8">
+        <WrapPanel Grid.Row="0">
+            <CheckBox IsChecked="{Binding AutoScrollLiveOutput}"
+                      Content="{Binding T[AutoScrollLiveOutput]}"
+                      VerticalAlignment="Center"
+                      Margin="0,0,12,0" />
+            <Button Click="OnCopySelectedLiveOutputClick"
+                    Content="{Binding T[CopySelectedLog]}" />
+        </WrapPanel>
+        <Border Grid.Row="1" BorderBrush="#CFCFCF" BorderThickness="1" CornerRadius="4">
+            <TextBox x:Name="LiveOutputTextBox"
+                     Text="{Binding LiveOutputText, Mode=OneWay}"
+                     IsReadOnly="True"
+                     AcceptsReturn="True"
+                     TextWrapping="NoWrap"
+                     VerticalAlignment="Stretch"
+                     ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                     ScrollViewer.VerticalScrollBarVisibility="Auto" />
+        </Border>
+    </Grid>
+</Window>
