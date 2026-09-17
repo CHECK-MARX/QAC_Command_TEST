@@ -1,38 +1,61 @@
 using System;
-using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
-using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
 using Avalonia.Platform.Storage;
-using Avalonia.Threading;
-using Avalonia.VisualTree;
 using LinUCommandTestGui.ViewModels;
 
 namespace LinUCommandTestGui.Views;
 
 public partial class MainWindow : Window
 {
-    private bool _autoScrollScheduled;
-    private MainWindowViewModel? _subscribedViewModel;
-    private readonly DispatcherTimer _liveLogAutoScrollTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
+    private LiveOutputWindow? _liveOutputWindow;
+    private ErrorAnalysisWindow? _errorAnalysisWindow;
 
     public MainWindow()
     {
         InitializeComponent();
-        DataContextChanged += OnDataContextChanged;
-        Closed += (_, _) => DetachLiveOutputSubscription();
-        _liveLogAutoScrollTimer.Tick += (_, _) =>
+    }
+
+    private void OnOpenLiveOutputWindowClick(object? sender, RoutedEventArgs e)
+    {
+        if (DataContext is not MainWindowViewModel vm)
         {
-            if (DataContext is MainWindowViewModel { IsRunning: true, AutoScrollLiveOutput: true })
-            {
-                ScheduleLiveOutputScroll();
-            }
-        };
-        _liveLogAutoScrollTimer.Start();
+            return;
+        }
+
+        if (_liveOutputWindow is null || !_liveOutputWindow.IsVisible)
+        {
+            _liveOutputWindow = new LiveOutputWindow { DataContext = vm };
+            _liveOutputWindow.Closed += (_, _) => _liveOutputWindow = null;
+            _liveOutputWindow.Show(this);
+        }
+        else
+        {
+            _liveOutputWindow.Activate();
+        }
+    }
+
+    private void OnOpenErrorAnalysisWindowClick(object? sender, RoutedEventArgs e)
+    {
+        if (DataContext is not MainWindowViewModel vm)
+        {
+            return;
+        }
+
+        if (_errorAnalysisWindow is null || !_errorAnalysisWindow.IsVisible)
+        {
+            _errorAnalysisWindow = new ErrorAnalysisWindow { DataContext = vm };
+            _errorAnalysisWindow.Closed += (_, _) => _errorAnalysisWindow = null;
+            _errorAnalysisWindow.Show(this);
+        }
+        else
+        {
+            _errorAnalysisWindow.Activate();
+        }
     }
 
     private async void OnBrowseCommandTestDirectoryClick(object? sender, RoutedEventArgs e)
@@ -215,125 +238,4 @@ public partial class MainWindow : Window
         return trimmed;
     }
 
-    private void OnDataContextChanged(object? sender, EventArgs e)
-    {
-        AttachLiveOutputSubscription();
-    }
-
-    private void AttachLiveOutputSubscription()
-    {
-        DetachLiveOutputSubscription();
-
-        if (DataContext is not MainWindowViewModel vm)
-        {
-            return;
-        }
-
-        _subscribedViewModel = vm;
-        _subscribedViewModel.PropertyChanged += OnViewModelPropertyChanged;
-        ScheduleLiveOutputScroll();
-    }
-
-    private void DetachLiveOutputSubscription()
-    {
-        if (_subscribedViewModel is not null)
-        {
-            _subscribedViewModel.PropertyChanged -= OnViewModelPropertyChanged;
-            _subscribedViewModel = null;
-        }
-    }
-
-    private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        if (DataContext is not MainWindowViewModel vm)
-        {
-            return;
-        }
-
-        if (string.Equals(e.PropertyName, nameof(MainWindowViewModel.LiveOutputText), StringComparison.Ordinal))
-        {
-            ScheduleLiveOutputScroll();
-            return;
-        }
-
-        if (string.Equals(e.PropertyName, nameof(MainWindowViewModel.AutoScrollLiveOutput), StringComparison.Ordinal)
-            && vm.AutoScrollLiveOutput)
-        {
-            ScheduleLiveOutputScroll();
-        }
-    }
-
-    private void ScheduleLiveOutputScroll()
-    {
-        if (DataContext is not MainWindowViewModel vm || !vm.AutoScrollLiveOutput)
-        {
-            return;
-        }
-
-        if (_autoScrollScheduled)
-        {
-            return;
-        }
-
-        _autoScrollScheduled = true;
-        Dispatcher.UIThread.Post(() =>
-        {
-            _autoScrollScheduled = false;
-            ScrollLiveOutputToBottom();
-            Dispatcher.UIThread.Post(ScrollLiveOutputToBottom, DispatcherPriority.Render);
-        }, DispatcherPriority.Background);
-    }
-
-    private void ScrollLiveOutputToBottom()
-    {
-        if (DataContext is not MainWindowViewModel vm || !vm.AutoScrollLiveOutput)
-        {
-            return;
-        }
-
-        if (string.IsNullOrEmpty(vm.LiveOutputText))
-        {
-            return;
-        }
-
-        LiveOutputTextBox.CaretIndex = vm.LiveOutputText.Length;
-        var viewer = LiveOutputTextBox.GetVisualDescendants().OfType<ScrollViewer>().FirstOrDefault();
-        if (viewer is null)
-        {
-            return;
-        }
-
-        var maxOffsetY = Math.Max(0, viewer.Extent.Height - viewer.Viewport.Height);
-        viewer.Offset = new Vector(viewer.Offset.X, maxOffsetY);
-    }
-
-    private async void OnCopySelectedLiveOutputClick(object? sender, RoutedEventArgs e)
-    {
-        if (DataContext is not MainWindowViewModel vm)
-        {
-            return;
-        }
-
-        var selectedText = LiveOutputTextBox.SelectedText;
-        if (string.IsNullOrEmpty(selectedText))
-        {
-            return;
-        }
-
-        try
-        {
-            var topLevel = TopLevel.GetTopLevel(this);
-            if (topLevel?.Clipboard is null)
-            {
-                vm.ReportUnhandledException("Clipboard is not available.");
-                return;
-            }
-
-            await topLevel.Clipboard.SetTextAsync(selectedText);
-        }
-        catch (Exception ex)
-        {
-            vm.ReportUnhandledException(ex.Message);
-        }
-    }
 }

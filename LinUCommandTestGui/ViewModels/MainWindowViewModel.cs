@@ -4083,7 +4083,7 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
     {
         ["ja"] = new(StringComparer.Ordinal)
         {
-            ["HeaderTitle"] = "Lin_U QAC コマンドテストランナー (C# + Avalonia)",
+            ["HeaderTitle"] = "QAC コマンドテストランナー (C# + Avalonia)",
             ["Language"] = "表示言語",
             ["SectionPaths"] = "パス設定",
             ["CommandTestDir"] = "コマンドテスト用ディレクトリ",
@@ -4139,11 +4139,15 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
             ["RunLogFile"] = "実行ログファイル",
             ["SectionLiveOutput"] = "リアルタイム出力",
             ["AutoScrollLiveOutput"] = "自動スクロール",
-            ["CopySelectedLog"] = "選択範囲をコピー"
+            ["CopySelectedLog"] = "選択範囲をコピー",
+            ["DetachedViews"] = "別ウィンドウ表示",
+            ["DetachedViewsHint"] = "リアルタイム出力とエラー解析は、メイン画面から切り離して表示できます。ウィンドウ端をドラッグしてサイズを変更してください。",
+            ["OpenLiveOutputWindow"] = "リアルタイム出力を開く",
+            ["OpenErrorAnalysisWindow"] = "エラー解析を開く"
         },
         ["en"] = new(StringComparer.Ordinal)
         {
-            ["HeaderTitle"] = "Lin_U QAC Command Test Runner (C# + Avalonia)",
+            ["HeaderTitle"] = "QAC Command Test Runner (C# + Avalonia)",
             ["Language"] = "Language",
             ["SectionPaths"] = "Paths",
             ["CommandTestDir"] = "Command Test Directory",
@@ -4208,7 +4212,11 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
             ["ErrorFirstSeen"] = "First Seen",
             ["ErrorLastSeen"] = "Last Seen",
             ["AutoScrollLiveOutput"] = "Auto-scroll",
-            ["CopySelectedLog"] = "Copy Selection"
+            ["CopySelectedLog"] = "Copy Selection",
+            ["DetachedViews"] = "Detached Windows",
+            ["DetachedViewsHint"] = "Live output and error analysis can be detached from the main window. Drag the window edge to resize it.",
+            ["OpenLiveOutputWindow"] = "Open Live Output",
+            ["OpenErrorAnalysisWindow"] = "Open Error Analysis"
         }
     };
 
