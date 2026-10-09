@@ -30,8 +30,13 @@ public partial class MainWindow : Window
         if (_liveOutputWindow is null || !_liveOutputWindow.IsVisible)
         {
             _liveOutputWindow = new LiveOutputWindow { DataContext = vm };
-            _liveOutputWindow.Closed += (_, _) => _liveOutputWindow = null;
+            _liveOutputWindow.Closed += (_, _) =>
+            {
+                _liveOutputWindow = null;
+                UpdateDetachedWindowState();
+            };
             _liveOutputWindow.Show();
+            UpdateDetachedWindowState();
         }
         else
         {
@@ -54,8 +59,13 @@ public partial class MainWindow : Window
         if (_errorAnalysisWindow is null || !_errorAnalysisWindow.IsVisible)
         {
             _errorAnalysisWindow = new ErrorAnalysisWindow { DataContext = vm };
-            _errorAnalysisWindow.Closed += (_, _) => _errorAnalysisWindow = null;
+            _errorAnalysisWindow.Closed += (_, _) =>
+            {
+                _errorAnalysisWindow = null;
+                UpdateDetachedWindowState();
+            };
             _errorAnalysisWindow.Show();
+            UpdateDetachedWindowState();
         }
         else
         {
@@ -66,6 +76,45 @@ public partial class MainWindow : Window
 
             _errorAnalysisWindow.Activate();
         }
+    }
+
+    private void OnHideMainWindowClick(object? sender, RoutedEventArgs e)
+    {
+        if (OperatingSystem.IsLinux()
+            && (_liveOutputWindow is not null || _errorAnalysisWindow is not null))
+        {
+            Hide();
+        }
+    }
+
+    private void UpdateDetachedWindowState()
+    {
+        var hasDetachedWindow = _liveOutputWindow is not null || _errorAnalysisWindow is not null;
+        HideMainWindowButton.IsEnabled = hasDetachedWindow;
+        if (OperatingSystem.IsLinux() && !hasDetachedWindow && !IsVisible)
+        {
+            RestoreFromDetachedWindow();
+        }
+    }
+
+    public void RestoreFromDetachedWindow()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        if (!IsVisible)
+        {
+            Show();
+        }
+
+        if (WindowState == WindowState.Minimized)
+        {
+            WindowState = WindowState.Normal;
+        }
+
+        Activate();
     }
 
     private async void OnBrowseCommandTestDirectoryClick(object? sender, RoutedEventArgs e)

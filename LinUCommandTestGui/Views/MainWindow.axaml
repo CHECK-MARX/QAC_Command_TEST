@@ -297,13 +297,19 @@
                 <Border Grid.Row="1" BorderBrush="#D0D0D0" BorderThickness="1" Padding="10" CornerRadius="4">
                     <StackPanel Spacing="10">
                         <TextBlock FontWeight="Bold" Text="{Binding T[DetachedViews]}" />
-                        <TextBlock Text="{Binding T[DetachedViewsHint]}" TextWrapping="Wrap" />
+                        <TextBlock Text="{Binding DetachedViewsHint}" TextWrapping="Wrap" />
                         <WrapPanel>
                             <Button Click="OnOpenLiveOutputWindowClick"
                                     Content="{Binding T[OpenLiveOutputWindow]}"
                                     Margin="0,0,8,0" />
                             <Button Click="OnOpenErrorAnalysisWindowClick"
                                     Content="{Binding T[OpenErrorAnalysisWindow]}" />
+                            <Button x:Name="HideMainWindowButton"
+                                    Click="OnHideMainWindowClick"
+                                    Content="{Binding T[HideMainWindow]}"
+                                    IsEnabled="False"
+                                    IsVisible="{Binding IsLinuxPlatform}"
+                                    Margin="8,0,0,0" />
                         </WrapPanel>
                     </StackPanel>
                 </Border>

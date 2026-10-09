@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
 using Avalonia.Threading;
@@ -97,6 +98,15 @@ public partial class LiveOutputWindow : Window
         catch (Exception ex)
         {
             _viewModel.ReportUnhandledException(ex.Message);
+        }
+    }
+
+    private void OnShowMainWindowClick(object? sender, RoutedEventArgs e)
+    {
+        if (Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime
+            { MainWindow: MainWindow mainWindow })
+        {
+            mainWindow.RestoreFromDetachedWindow();
         }
     }
 }
