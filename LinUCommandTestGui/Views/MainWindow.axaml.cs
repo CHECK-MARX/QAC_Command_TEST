@@ -35,12 +35,19 @@ public partial class MainWindow : Window
                 _liveOutputWindow = null;
                 UpdateDetachedWindowState();
             };
-            _liveOutputWindow.Show();
+            if (OperatingSystem.IsLinux())
+            {
+                _liveOutputWindow.Show();
+            }
+            else
+            {
+                _liveOutputWindow.Show(this);
+            }
             UpdateDetachedWindowState();
         }
         else
         {
-            if (_liveOutputWindow.WindowState == WindowState.Minimized)
+            if (OperatingSystem.IsLinux() && _liveOutputWindow.WindowState == WindowState.Minimized)
             {
                 _liveOutputWindow.WindowState = WindowState.Normal;
             }
@@ -64,12 +71,19 @@ public partial class MainWindow : Window
                 _errorAnalysisWindow = null;
                 UpdateDetachedWindowState();
             };
-            _errorAnalysisWindow.Show();
+            if (OperatingSystem.IsLinux())
+            {
+                _errorAnalysisWindow.Show();
+            }
+            else
+            {
+                _errorAnalysisWindow.Show(this);
+            }
             UpdateDetachedWindowState();
         }
         else
         {
-            if (_errorAnalysisWindow.WindowState == WindowState.Minimized)
+            if (OperatingSystem.IsLinux() && _errorAnalysisWindow.WindowState == WindowState.Minimized)
             {
                 _errorAnalysisWindow.WindowState = WindowState.Normal;
             }
@@ -89,9 +103,14 @@ public partial class MainWindow : Window
 
     private void UpdateDetachedWindowState()
     {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
         var hasDetachedWindow = _liveOutputWindow is not null || _errorAnalysisWindow is not null;
         HideMainWindowButton.IsEnabled = hasDetachedWindow;
-        if (OperatingSystem.IsLinux() && !hasDetachedWindow && !IsVisible)
+        if (!hasDetachedWindow && !IsVisible)
         {
             RestoreFromDetachedWindow();
         }
