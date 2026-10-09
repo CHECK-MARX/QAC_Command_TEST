@@ -30,11 +30,28 @@ public partial class MainWindow : Window
         if (_liveOutputWindow is null || !_liveOutputWindow.IsVisible)
         {
             _liveOutputWindow = new LiveOutputWindow { DataContext = vm };
-            _liveOutputWindow.Closed += (_, _) => _liveOutputWindow = null;
-            _liveOutputWindow.Show(this);
+            _liveOutputWindow.Closed += (_, _) =>
+            {
+                _liveOutputWindow = null;
+                UpdateDetachedWindowState();
+            };
+            if (OperatingSystem.IsLinux())
+            {
+                _liveOutputWindow.Show();
+            }
+            else
+            {
+                _liveOutputWindow.Show(this);
+            }
+            UpdateDetachedWindowState();
         }
         else
         {
+            if (OperatingSystem.IsLinux() && _liveOutputWindow.WindowState == WindowState.Minimized)
+            {
+                _liveOutputWindow.WindowState = WindowState.Normal;
+            }
+
             _liveOutputWindow.Activate();
         }
     }
@@ -49,13 +66,74 @@ public partial class MainWindow : Window
         if (_errorAnalysisWindow is null || !_errorAnalysisWindow.IsVisible)
         {
             _errorAnalysisWindow = new ErrorAnalysisWindow { DataContext = vm };
-            _errorAnalysisWindow.Closed += (_, _) => _errorAnalysisWindow = null;
-            _errorAnalysisWindow.Show(this);
+            _errorAnalysisWindow.Closed += (_, _) =>
+            {
+                _errorAnalysisWindow = null;
+                UpdateDetachedWindowState();
+            };
+            if (OperatingSystem.IsLinux())
+            {
+                _errorAnalysisWindow.Show();
+            }
+            else
+            {
+                _errorAnalysisWindow.Show(this);
+            }
+            UpdateDetachedWindowState();
         }
         else
         {
+            if (OperatingSystem.IsLinux() && _errorAnalysisWindow.WindowState == WindowState.Minimized)
+            {
+                _errorAnalysisWindow.WindowState = WindowState.Normal;
+            }
+
             _errorAnalysisWindow.Activate();
         }
+    }
+
+    private void OnHideMainWindowClick(object? sender, RoutedEventArgs e)
+    {
+        if (OperatingSystem.IsLinux()
+            && (_liveOutputWindow is not null || _errorAnalysisWindow is not null))
+        {
+            Hide();
+        }
+    }
+
+    private void UpdateDetachedWindowState()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var hasDetachedWindow = _liveOutputWindow is not null || _errorAnalysisWindow is not null;
+        HideMainWindowButton.IsEnabled = hasDetachedWindow;
+        if (!hasDetachedWindow && !IsVisible)
+        {
+            RestoreFromDetachedWindow();
+        }
+    }
+
+    public void RestoreFromDetachedWindow()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        if (!IsVisible)
+        {
+            Show();
+        }
+
+        if (WindowState == WindowState.Minimized)
+        {
+            WindowState = WindowState.Normal;
+        }
+
+        Activate();
     }
 
     private async void OnBrowseCommandTestDirectoryClick(object? sender, RoutedEventArgs e)

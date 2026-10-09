@@ -13,6 +13,10 @@
         <WrapPanel Grid.Row="0">
             <TextBlock Text="{Binding ExtractedErrorCountLabel}" Margin="0,0,8,0" />
             <TextBlock Text="{Binding ExtractedErrorCount}" FontWeight="Bold" />
+            <Button Click="OnShowMainWindowClick"
+                    Content="{Binding T[ShowMainWindow]}"
+                    IsVisible="{Binding IsLinuxPlatform}"
+                    Margin="12,0,0,0" />
         </WrapPanel>
         <Border Grid.Row="1" BorderBrush="#CFCFCF" BorderThickness="1" CornerRadius="4">
             <ListBox ItemsSource="{Binding ErrorFindings}">

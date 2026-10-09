@@ -1,4 +1,6 @@
 using Avalonia;
+using System;
+using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Data.Core;
 using Avalonia.Data.Core.Plugins;
@@ -34,6 +36,11 @@ public partial class App : Application
 
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
+            if (OperatingSystem.IsLinux())
+            {
+                desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
+            }
+
             desktop.MainWindow = new MainWindow
             {
                 DataContext = new MainWindowViewModel(),

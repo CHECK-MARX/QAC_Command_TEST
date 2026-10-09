@@ -320,6 +320,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         T.SetLanguage(value.Code);
         OnPropertyChanged(nameof(PrecheckButtonText));
+        OnPropertyChanged(nameof(DetachedViewsHint));
         OnPropertyChanged(nameof(ErrorAnalysisTabTitle));
         OnPropertyChanged(nameof(ExtractedErrorCountLabel));
         OnPropertyChanged(nameof(SecondUnitText));
@@ -364,6 +365,10 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     public string PrecheckButtonText => LocalizeText("\u4E8B\u524D\u78BA\u8A8D", "Precheck");
+
+    public bool IsLinuxPlatform => OperatingSystem.IsLinux();
+
+    public string DetachedViewsHint => T[IsLinuxPlatform ? "DetachedViewsHintLinux" : "DetachedViewsHint"];
 
     public string HeaderTitleWithBuild => $"{T["HeaderTitle"]}  {PlatformRuntime.BuildIdentity}";
 
@@ -3797,6 +3802,19 @@ public partial class MainWindowViewModel : ViewModelBase
             return false;
         }
 
+        if (OperatingSystem.IsLinux()
+            && ((normalized.Contains("前のスナップショット", StringComparison.Ordinal)
+                && normalized.Contains("処理中", StringComparison.Ordinal))
+            || (normalized.Contains("previous snapshot", StringComparison.OrdinalIgnoreCase)
+                && normalized.Contains("processing", StringComparison.OrdinalIgnoreCase))))
+        {
+            insight = new ErrorInsight(
+                LocalizeText("スナップショット処理待ち", "Snapshot Processing Pending"),
+                LocalizeText("サーバーが前のスナップショットを処理中のため、次の処理は受け付けられませんでした。", "The server was still processing the previous snapshot and rejected the next operation."),
+                LocalizeText("前のスナップショットの処理完了をサーバーで確認し、失敗した qacli コマンドから再実行してください。", "Confirm that the previous snapshot has finished on the server, then retry from the failed qacli command."));
+            return true;
+        }
+
         var componentMatch = InvalidComponentRegex.Match(normalized);
         if (componentMatch.Success
             && (normalized.Contains("無効", StringComparison.Ordinal)
@@ -4142,8 +4160,11 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
             ["CopySelectedLog"] = "選択範囲をコピー",
             ["DetachedViews"] = "別ウィンドウ表示",
             ["DetachedViewsHint"] = "リアルタイム出力とエラー解析は、メイン画面から切り離して表示できます。ウィンドウ端をドラッグしてサイズを変更してください。",
+            ["DetachedViewsHintLinux"] = "補助画面を開いた後、「本体のみ隠す」で補助画面だけを残せます。各補助画面の「本体を表示」で戻せます。",
             ["OpenLiveOutputWindow"] = "リアルタイム出力を開く",
-            ["OpenErrorAnalysisWindow"] = "エラー解析を開く"
+            ["OpenErrorAnalysisWindow"] = "エラー解析を開く",
+            ["HideMainWindow"] = "本体のみ隠す",
+            ["ShowMainWindow"] = "本体を表示"
         },
         ["en"] = new(StringComparer.Ordinal)
         {
@@ -4215,8 +4236,11 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
             ["CopySelectedLog"] = "Copy Selection",
             ["DetachedViews"] = "Detached Windows",
             ["DetachedViewsHint"] = "Live output and error analysis can be detached from the main window. Drag the window edge to resize it.",
+            ["DetachedViewsHintLinux"] = "Open a detached window, then use Hide Main Window to leave it visible. Use Show Main Window to return.",
             ["OpenLiveOutputWindow"] = "Open Live Output",
-            ["OpenErrorAnalysisWindow"] = "Open Error Analysis"
+            ["OpenErrorAnalysisWindow"] = "Open Error Analysis",
+            ["HideMainWindow"] = "Hide Main Window",
+            ["ShowMainWindow"] = "Show Main Window"
         }
     };
 
