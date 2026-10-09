@@ -31,10 +31,15 @@ public partial class MainWindow : Window
         {
             _liveOutputWindow = new LiveOutputWindow { DataContext = vm };
             _liveOutputWindow.Closed += (_, _) => _liveOutputWindow = null;
-            _liveOutputWindow.Show(this);
+            _liveOutputWindow.Show();
         }
         else
         {
+            if (_liveOutputWindow.WindowState == WindowState.Minimized)
+            {
+                _liveOutputWindow.WindowState = WindowState.Normal;
+            }
+
             _liveOutputWindow.Activate();
         }
     }
@@ -50,10 +55,15 @@ public partial class MainWindow : Window
         {
             _errorAnalysisWindow = new ErrorAnalysisWindow { DataContext = vm };
             _errorAnalysisWindow.Closed += (_, _) => _errorAnalysisWindow = null;
-            _errorAnalysisWindow.Show(this);
+            _errorAnalysisWindow.Show();
         }
         else
         {
+            if (_errorAnalysisWindow.WindowState == WindowState.Minimized)
+            {
+                _errorAnalysisWindow.WindowState = WindowState.Normal;
+            }
+
             _errorAnalysisWindow.Activate();
         }
     }
