@@ -1986,45 +1986,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         Directory.CreateDirectory(RuntimeDirectoryPath);
         var retryEnvironmentPath = Path.Combine(RuntimeDirectoryPath, "qacli-license-retry.sh");
-        const string retryEnvironmentScript = """
-            # GUI runtime guard for transient Perforce QAC license contention.
-            # This file is generated automatically; edit MainWindowViewModel.cs instead.
-            qacli() {
-              local qacli_attempt=1
-              local qacli_max_attempts=4
-              local qacli_retry_wait_seconds=30
-              local qacli_rc=0
-              local qacli_output_file
-
-              qacli_output_file="$(mktemp "${TMPDIR:-/tmp}/linu-qacli.XXXXXX")" || return 1
-              while [ "$qacli_attempt" -le "$qacli_max_attempts" ]; do
-                "$LINU_REAL_QACLI" "$@" >"$qacli_output_file" 2>&1
-                qacli_rc=$?
-
-                if grep -Eiq 'ライセンスが(拒否|欠如)|ライセンス.*(不足|利用できません)|license.*(denied|refused|missing|unavailable)|communications error with license server' "$qacli_output_file"; then
-                  if [ "$qacli_attempt" -lt "$qacli_max_attempts" ]; then
-                    printf '[GUI-LICENSE-RETRY] ライセンス確保待ち: %s秒後に再試行します (%s/%s)\n' \
-                      "$qacli_retry_wait_seconds" "$qacli_attempt" "$qacli_max_attempts"
-                    rm -f "$qacli_output_file"
-                    sleep "$qacli_retry_wait_seconds"
-                    qacli_output_file="$(mktemp "${TMPDIR:-/tmp}/linu-qacli.XXXXXX")" || return 1
-                    qacli_attempt=$((qacli_attempt + 1))
-                    continue
-                  fi
-                fi
-
-                cat "$qacli_output_file"
-                rm -f "$qacli_output_file"
-                return "$qacli_rc"
-              done
-
-              rm -f "$qacli_output_file"
-              return "$qacli_rc"
-            }
-            export -f qacli
-            """;
-
-        File.WriteAllText(retryEnvironmentPath, retryEnvironmentScript, Utf8WithoutBom);
+        File.WriteAllText(retryEnvironmentPath, PlatformRuntime.LinuxQacliLicenseRetryScript, Utf8WithoutBom);
         startInfo.Environment["BASH_ENV"] = retryEnvironmentPath;
         startInfo.Environment["LINU_REAL_QACLI"] = qacliPath;
     }
@@ -3217,7 +3179,11 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private static bool IsFailureOutputLine(string line)
     {
-        if (IsNonErrorSummaryLine(line) || IsCompatibilityLimitationLine(line))
+        // The Linux wrapper streams each attempt, including recoverable license errors.
+        // It emits [ERR] only after the final retry fails.
+        if (IsNonErrorSummaryLine(line)
+            || IsCompatibilityLimitationLine(line)
+            || PlatformRuntime.IsRetryableQacliLicenseMessage(line))
         {
             return false;
         }
