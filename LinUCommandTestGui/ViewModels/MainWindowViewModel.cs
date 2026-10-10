@@ -102,7 +102,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private string valPass = string.Empty;
 
     [ObservableProperty]
-    private bool autoConfirmPrompts = true;
+    private bool autoConfirmPrompts;
 
     [ObservableProperty]
     private int promptDelayMilliseconds = 1300;
@@ -114,12 +114,31 @@ public partial class MainWindowViewModel : ViewModelBase
     [NotifyCanExecuteChangedFor(nameof(StartTestCommand))]
     [NotifyCanExecuteChangedFor(nameof(StopTestCommand))]
     [NotifyCanExecuteChangedFor(nameof(PrecheckSettingsCommand))]
+    [NotifyCanExecuteChangedFor(nameof(ContinueTestCommand))]
     private bool isRunning;
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(StartTestCommand))]
     [NotifyCanExecuteChangedFor(nameof(StopTestCommand))]
+    [NotifyCanExecuteChangedFor(nameof(ContinueTestCommand))]
     private bool isPaused;
+
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ContinueTestCommand))]
+    private bool isWaitingForEnter;
+
+    private readonly PromptConfirmationGate _promptGate = new();
+
+    private bool CanContinueTest() => IsRunning && !IsPaused && IsWaitingForEnter;
+
+    [RelayCommand(CanExecute = nameof(CanContinueTest))]
+    private Task ContinueTestAsync() => SendPromptConfirmationAsync(automatic: false);
+
+    partial void OnAutoConfirmPromptsChanged(bool value)
+    {
+        if (value && IsWaitingForEnter && IsRunning && !IsPaused)
+            _ = SendPromptConfirmationAsync(automatic: true);
+    }
 
     [ObservableProperty]
     private string statusText = "Idle";
@@ -617,6 +636,8 @@ public partial class MainWindowViewModel : ViewModelBase
                 throw new InvalidOperationException(BuildConfigurationErrorMessage(configurationErrors));
             }
 
+            _promptGate.Clear();
+            IsWaitingForEnter = false;
             IsRunning = true;
             IsPaused = false;
             _stopRequested = false;
@@ -685,7 +706,13 @@ public partial class MainWindowViewModel : ViewModelBase
             RunningProcessId = process.Id;
             StatusText = FormatRunningStatus(RunningProcessId);
             AppendLog($"[GUI] Process started: {launch.DisplayCommand}", false, true);
-            await AppendRunLogLineAsync($"[GUI] Process started: {launch.DisplayCommand}");
+            await AppendRunLogLineAsync($"[RUN-SCRIPT] {launch.DisplayCommand}");
+            if (OperatingSystem.IsLinux())
+            {
+                var sourcePath = LinuxTestRuntime.FindOriginalScript(LinURootPath)!;
+                var sourceHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(sourcePath)));
+                await AppendRunLogLineAsync($"[RUN-SCRIPT] sha256={sourceHash} command_retries=0 editor_skipped=false");
+            }
 
             StartProcessOutputPump();
             var standardOutputPump = PumpProcessStreamAsync(process.StandardOutput, isError: false);
@@ -754,16 +781,6 @@ public partial class MainWindowViewModel : ViewModelBase
 
             if (exitCode == 0 && !_failureDetectedDuringRun)
             {
-                if (ProcessedSummaryCount == 0)
-                {
-                    ProcessedSummaryCount = ConfiguredLoopCount;
-                }
-
-                if (TotalSuccessInSummaries == 0 && TotalFailureInSummaries == 0)
-                {
-                    TotalSuccessInSummaries = ConfiguredLoopCount;
-                }
-
                 TotalFailureInSummaries = 0;
                 CompleteFinishedScriptProgress();
                 RunResult = "PASS";
@@ -818,6 +835,8 @@ public partial class MainWindowViewModel : ViewModelBase
             _processExitWaitCts = null;
             _runningProcess?.Dispose();
             _runningProcess = null;
+            _promptGate.Clear();
+            IsWaitingForEnter = false;
             IsRunning = false;
             IsPaused = false;
             RunningProcessId = 0;
@@ -1705,7 +1724,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 $"cmd.exe /d /c \"{launchScript}\"");
         }
 
-        var shellScript = FindFirstExistingFile(LinURootPath, "testloop.generated.sh", "testloop.sh", "test_loop.sh");
+        var shellScript = LinuxTestRuntime.FindOriginalScript(LinURootPath);
         if (shellScript is not null)
         {
             _estimatedCommandsPerLoop = 0;
@@ -1931,27 +1950,7 @@ public partial class MainWindowViewModel : ViewModelBase
         };
         if (OperatingSystem.IsLinux())
         {
-            var editorProxy = Environment.ProcessPath;
-            if (string.IsNullOrWhiteSpace(editorProxy) || !File.Exists(editorProxy))
-            {
-                editorProxy = Path.Combine(AppContext.BaseDirectory, "LinUCommandTestGui");
-            }
-
-            if (!File.Exists(editorProxy))
-            {
-                throw new FileNotFoundException(
-                    "GUIエディター中継実行ファイルが見つかりません。",
-                    editorProxy);
-            }
-
-            startInfo.Environment["EDITOR"] = editorProxy;
-            startInfo.Environment["VISUAL"] = editorProxy;
-            startInfo.Environment[Program.EditorProxyEnvironmentVariable] = "1";
-        }
-
-        if (OperatingSystem.IsLinux())
-        {
-            ConfigureLinuxQacliLicenseRetry(startInfo);
+            ConfigureLinuxTerminalBridge(startInfo);
         }
 
         SetEnvironmentIfNotEmpty(startInfo, "QAF_ROOT", QafRoot);
@@ -1977,7 +1976,8 @@ public partial class MainWindowViewModel : ViewModelBase
         };
     }
 
-    private void ConfigureLinuxQacliLicenseRetry(ProcessStartInfo startInfo)
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    private void ConfigureLinuxTerminalBridge(ProcessStartInfo startInfo)
     {
         if (!TryResolveQacliExecutablePath(out var qacliPath, out var qacliError))
         {
@@ -1985,48 +1985,14 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         Directory.CreateDirectory(RuntimeDirectoryPath);
-        var retryEnvironmentPath = Path.Combine(RuntimeDirectoryPath, "qacli-license-retry.sh");
-        const string retryEnvironmentScript = """
-            # GUI runtime guard for transient Perforce QAC license contention.
-            # This file is generated automatically; edit MainWindowViewModel.cs instead.
-            qacli() {
-              local qacli_attempt=1
-              local qacli_max_attempts=4
-              local qacli_retry_wait_seconds=30
-              local qacli_rc=0
-              local qacli_output_file
-
-              qacli_output_file="$(mktemp "${TMPDIR:-/tmp}/linu-qacli.XXXXXX")" || return 1
-              while [ "$qacli_attempt" -le "$qacli_max_attempts" ]; do
-                "$LINU_REAL_QACLI" "$@" >"$qacli_output_file" 2>&1
-                qacli_rc=$?
-
-                if grep -Eiq 'ライセンスが(拒否|欠如)|ライセンス.*(不足|利用できません)|license.*(denied|refused|missing|unavailable)|communications error with license server' "$qacli_output_file"; then
-                  if [ "$qacli_attempt" -lt "$qacli_max_attempts" ]; then
-                    printf '[GUI-LICENSE-RETRY] ライセンス確保待ち: %s秒後に再試行します (%s/%s)\n' \
-                      "$qacli_retry_wait_seconds" "$qacli_attempt" "$qacli_max_attempts"
-                    rm -f "$qacli_output_file"
-                    sleep "$qacli_retry_wait_seconds"
-                    qacli_output_file="$(mktemp "${TMPDIR:-/tmp}/linu-qacli.XXXXXX")" || return 1
-                    qacli_attempt=$((qacli_attempt + 1))
-                    continue
-                  fi
-                fi
-
-                cat "$qacli_output_file"
-                rm -f "$qacli_output_file"
-                return "$qacli_rc"
-              done
-
-              rm -f "$qacli_output_file"
-              return "$qacli_rc"
-            }
-            export -f qacli
-            """;
-
-        File.WriteAllText(retryEnvironmentPath, retryEnvironmentScript, Utf8WithoutBom);
-        startInfo.Environment["BASH_ENV"] = retryEnvironmentPath;
+        var bridgeEnvironmentPath = Path.Combine(RuntimeDirectoryPath, "qacli-terminal-bridge.sh");
+        File.WriteAllText(bridgeEnvironmentPath, LinuxTestRuntime.ShellBridge, Utf8WithoutBom);
+        startInfo.Environment["BASH_ENV"] = bridgeEnvironmentPath;
         startInfo.Environment["LINU_REAL_QACLI"] = qacliPath;
+        var editorPath = Path.Combine(RuntimeDirectoryPath, "qacli-editor-tty.sh");
+        File.WriteAllText(editorPath, LinuxTestRuntime.EditorScript, Utf8WithoutBom);
+        File.SetUnixFileMode(editorPath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        startInfo.Environment["LINU_TERMINAL_EDITOR"] = editorPath;
     }
 
     private void HandleProcessOutputLine(string? line, bool isError)
@@ -2222,9 +2188,12 @@ public partial class MainWindowViewModel : ViewModelBase
                 RecordErrorFinding(normalizedLine);
             }
 
-            if (AutoConfirmPrompts && IsPausePrompt(output.Line))
+            if (IsPausePrompt(output.Line))
             {
-                _ = SendAutoConfirmAsync();
+                _promptGate.Observe();
+                IsWaitingForEnter = true;
+                if (AutoConfirmPrompts)
+                    _ = SendPromptConfirmationAsync(automatic: true);
             }
 
             runLogBatch.Add(output.Line);
@@ -2630,8 +2599,9 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
-    private async Task SendAutoConfirmAsync()
+    private async Task SendPromptConfirmationAsync(bool automatic)
     {
+        var promptGeneration = _promptGate.Generation;
         var requestedProcess = _runningProcess;
         if (requestedProcess is null || requestedProcess.HasExited)
         {
@@ -2650,7 +2620,7 @@ public partial class MainWindowViewModel : ViewModelBase
             }
 
             // Honor the delay shown in the GUI after the actual prompt was observed.
-            if (PromptDelayMilliseconds > 0)
+            if (automatic && PromptDelayMilliseconds > 0)
             {
                 await Task.Delay(PromptDelayMilliseconds);
                 process = _runningProcess;
@@ -2662,11 +2632,18 @@ public partial class MainWindowViewModel : ViewModelBase
                 }
             }
 
+            if (!IsRunning || IsPaused || (automatic && !AutoConfirmPrompts)
+                || !_promptGate.TryConsume(promptGeneration))
+                return;
+
+            IsWaitingForEnter = false;
             await process.StandardInput.WriteLineAsync(string.Empty);
             await process.StandardInput.FlushAsync();
 
-            AutoEnterCount += 1;
-            const string message = "[GUI] Auto-confirm sent after prompt detection.";
+            if (automatic) AutoEnterCount += 1;
+            var message = automatic
+                ? "[RUN-INPUT] Auto Enter sent for observed prompt."
+                : "[RUN-INPUT] Manual Enter sent for observed prompt.";
             AppendLog(message, false, true);
             await AppendRunLogLineAsync(message);
         }
@@ -3215,9 +3192,9 @@ public partial class MainWindowViewModel : ViewModelBase
         return false;
     }
 
-    private static bool IsFailureOutputLine(string line)
+    internal static bool IsFailureOutputLine(string line)
     {
-        if (IsNonErrorSummaryLine(line) || IsCompatibilityLimitationLine(line))
+        if (LinuxTestRuntime.IsTerminalDiagnostic(line) || IsNonErrorSummaryLine(line) || IsCompatibilityLimitationLine(line))
         {
             return false;
         }
@@ -3302,7 +3279,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private static bool IsErrorHintOutputLine(string line)
     {
-        if (IsNonErrorSummaryLine(line) || IsCompatibilityLimitationLine(line))
+        if (LinuxTestRuntime.IsTerminalDiagnostic(line) || IsNonErrorSummaryLine(line) || IsCompatibilityLimitationLine(line))
         {
             return false;
         }
@@ -3792,7 +3769,7 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         var normalized = line.Trim();
-        if (IsNonErrorSummaryLine(normalized))
+        if (LinuxTestRuntime.IsTerminalDiagnostic(normalized) || IsNonErrorSummaryLine(normalized))
         {
             return false;
         }
@@ -4133,6 +4110,7 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
             ["StopOnError"] = "最初のエラーで停止",
             ["PromptDelay"] = "検出後の入力遅延 (ms)",
             ["AutoEnterCount"] = "自動入力回数",
+            ["ContinueTest"] = "次へ（Enter）",
             ["Status"] = "ステータス",
             ["RunResult"] = "実行結果",
             ["Verdict"] = "判定",
@@ -4201,6 +4179,7 @@ public sealed class LocalizationTexts : INotifyPropertyChanged
             ["StopOnError"] = "Stop on first error",
             ["PromptDelay"] = "Delay after detection (ms)",
             ["AutoEnterCount"] = "Auto-enter count",
+            ["ContinueTest"] = "Continue (Enter)",
             ["Status"] = "Status",
             ["RunResult"] = "Run Result",
             ["Verdict"] = "Verdict",

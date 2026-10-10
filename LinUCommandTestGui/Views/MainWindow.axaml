@@ -199,6 +199,7 @@
                         <WrapPanel>
                             <Button Command="{Binding PrecheckSettingsCommand}" Content="{Binding PrecheckButtonText}" Margin="0,0,8,0" />
                             <Button Command="{Binding StartTestCommand}" Content="{Binding T[StartTest]}" Margin="0,0,8,0" />
+                            <Button Command="{Binding ContinueTestCommand}" Content="{Binding T[ContinueTest]}" Margin="0,0,8,0" />
                             <Button Command="{Binding StopTestCommand}" Content="{Binding T[Stop]}" Margin="0,0,8,0" />
                             <Button Command="{Binding ClearLogsCommand}" Content="{Binding T[ClearGuiLog]}" />
                         </WrapPanel>
