@@ -6,6 +6,7 @@ using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
 namespace LinUCommandTestGui;
@@ -16,6 +17,53 @@ namespace LinUCommandTestGui;
 /// </summary>
 public static class PlatformRuntime
 {
+    private static readonly Regex RetryableQacliLicenseMessageRegex = new(
+        "ライセンスが(拒否|欠如)|ライセンス.*(不足|利用できません)|license.*(denied|refused|missing|unavailable)|communications error with license server",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    // Bash runs this file through BASH_ENV for the test script. Keep qacli output live:
+    // qacli can ask for input before it exits, and the GUI must see that prompt.
+    public const string LinuxQacliLicenseRetryScript = """
+        # GUI runtime guard for transient Perforce QAC license contention.
+        # This file is generated automatically; edit PlatformRuntime.cs instead.
+        qacli() {
+          local qacli_attempt=1
+          local qacli_max_attempts=4
+          local qacli_retry_wait_seconds=30
+          local qacli_rc=0
+          local qacli_output_file
+
+          while [ "$qacli_attempt" -le "$qacli_max_attempts" ]; do
+            qacli_output_file="$(mktemp "${TMPDIR:-/tmp}/linu-qacli.XXXXXX")" || return 1
+            "$LINU_REAL_QACLI" "$@" 2>&1 | tee "$qacli_output_file"
+            qacli_rc=${PIPESTATUS[0]}
+
+            if grep -Eiq 'ライセンスが(拒否|欠如)|ライセンス.*(不足|利用できません)|license.*(denied|refused|missing|unavailable)|communications error with license server' "$qacli_output_file"; then
+              rm -f "$qacli_output_file"
+              if [ "$qacli_attempt" -lt "$qacli_max_attempts" ]; then
+                printf '[GUI-LICENSE-RETRY] ライセンス確保待ち: %s秒後に再試行します (%s/%s)\n' \
+                  "$qacli_retry_wait_seconds" "$qacli_attempt" "$qacli_max_attempts"
+                sleep "$qacli_retry_wait_seconds"
+                qacli_attempt=$((qacli_attempt + 1))
+                continue
+              fi
+              printf '[ERR] qacli license retry exhausted after %s attempts.\n' "$qacli_max_attempts"
+              if [ "$qacli_rc" -eq 0 ]; then qacli_rc=1; fi
+              return "$qacli_rc"
+            fi
+
+            rm -f "$qacli_output_file"
+            return "$qacli_rc"
+          done
+        }
+        export -f qacli
+        """;
+
+    public static bool IsRetryableQacliLicenseMessage(string line)
+    {
+        return RetryableQacliLicenseMessageRegex.IsMatch(line);
+    }
+
     public const string ValidateAuthTimeoutEnvironmentVariable = "LINU_VAL_AUTH_TIMEOUT_SECONDS";
     public const int DefaultValidateAuthTimeoutSeconds = 60;
     public const int MinimumValidateAuthTimeoutSeconds = 10;
