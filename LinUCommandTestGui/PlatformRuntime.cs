@@ -33,9 +33,17 @@ public static class PlatformRuntime
           local qacli_rc=0
           local qacli_output_file
 
+          linu_qacli_invoke() {
+            if [ -n "${LINU_QACLI_INVOKER:-}" ]; then
+              "$LINU_QACLI_INVOKER" "$@"
+            else
+              "$LINU_REAL_QACLI" "$@"
+            fi
+          }
+
           while [ "$qacli_attempt" -le "$qacli_max_attempts" ]; do
             qacli_output_file="$(mktemp "${TMPDIR:-/tmp}/linu-qacli.XXXXXX")" || return 1
-            "$LINU_REAL_QACLI" "$@" 2>&1 | tee "$qacli_output_file"
+            linu_qacli_invoke "$@" 2>&1 | tee "$qacli_output_file"
             qacli_rc=${PIPESTATUS[0]}
 
             if grep -Eiq 'ライセンスが(拒否|欠如)|ライセンス.*(不足|利用できません)|license.*(denied|refused|missing|unavailable)|communications error with license server' "$qacli_output_file"; then
