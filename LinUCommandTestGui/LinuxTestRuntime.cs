@@ -27,7 +27,7 @@ public static class LinuxTestRuntime
     public const string ShellBridge = """
         # GUI terminal bridge. Ordinary commands run unchanged, without retries.
         # This file is generated automatically; edit LinuxTestRuntime.cs instead.
-        qacli() {
+        linu_terminal_bridge_qacli() {
           # Interactive editors must have a visible terminal, not captured output.
           if [ "${1:-}" = project ] && [ "${2:-}" = config-file ]; then
             local qacli_arg
@@ -78,6 +78,9 @@ public static class LinuxTestRuntime
           # Preserve terminal I/O, output timing, arguments and status. Execute exactly once.
           "$LINU_REAL_QACLI" "$@"
         }
-        export -f qacli
+        qacli() {
+          linu_terminal_bridge_qacli "$@"
+        }
+        export -f linu_terminal_bridge_qacli qacli
         """;
 }

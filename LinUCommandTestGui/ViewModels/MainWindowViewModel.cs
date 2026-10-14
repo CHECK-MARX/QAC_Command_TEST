@@ -1986,8 +1986,12 @@ public partial class MainWindowViewModel : ViewModelBase
 
         Directory.CreateDirectory(RuntimeDirectoryPath);
         var bridgeEnvironmentPath = Path.Combine(RuntimeDirectoryPath, "qacli-terminal-bridge.sh");
-        File.WriteAllText(bridgeEnvironmentPath, LinuxTestRuntime.ShellBridge, Utf8WithoutBom);
+        File.WriteAllText(
+            bridgeEnvironmentPath,
+            LinuxTestRuntime.ShellBridge + Environment.NewLine + PlatformRuntime.LinuxQacliLicenseRetryScript,
+            Utf8WithoutBom);
         startInfo.Environment["BASH_ENV"] = bridgeEnvironmentPath;
+        startInfo.Environment["LINU_QACLI_INVOKER"] = "linu_terminal_bridge_qacli";
         startInfo.Environment["LINU_REAL_QACLI"] = qacliPath;
         var editorPath = Path.Combine(RuntimeDirectoryPath, "qacli-editor-tty.sh");
         File.WriteAllText(editorPath, LinuxTestRuntime.EditorScript, Utf8WithoutBom);
@@ -3194,7 +3198,14 @@ public partial class MainWindowViewModel : ViewModelBase
 
     internal static bool IsFailureOutputLine(string line)
     {
-        if (LinuxTestRuntime.IsTerminalDiagnostic(line) || IsNonErrorSummaryLine(line) || IsCompatibilityLimitationLine(line))
+        // The Linux wrapper streams each attempt, including recoverable license errors.
+        // It emits [ERR] only after the final retry fails.
+        if (LinuxTestRuntime.IsTerminalDiagnostic(line)
+            || IsNonErrorSummaryLine(line)
+            || IsCompatibilityLimitationLine(line)
+            || (PlatformRuntime.IsRetryableQacliLicenseMessage(line)
+                && !line.TrimStart().StartsWith("fatal:", StringComparison.OrdinalIgnoreCase)
+                && line.IndexOf("[ERR]", StringComparison.OrdinalIgnoreCase) < 0))
         {
             return false;
         }
